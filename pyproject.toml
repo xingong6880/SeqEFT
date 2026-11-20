@@ -17,6 +17,10 @@ dependencies = [
     "PyYAML==6.0.3",
     "einops==0.8.2",
     "linear-attention-transformer==0.19.1",
+    "axial-positional-embedding==0.2.1",
+    "linformer==0.2.3",
+    "local-attention==1.8.6",
+    "product-key-memory==0.1.11",
 ]
 
 [project.optional-dependencies]
