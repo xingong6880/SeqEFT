@@ -1,0 +1,38 @@
+# Stage 1：固定 25 epochs / 800 updates，仅使用训练集。
+experiment:
+  name: seqeft_vae
+  seed: 2026
+  output_root: outputs/vae
+data:
+  cache_root: data/cache/resting_state
+  split_file: configs/splits/resting_state.yaml
+  window_length: 512
+  roi_count: 64
+  tr_seconds: 2.1
+model:
+  input_length: 512
+  latent_length: 256
+  temporal_compression: 2
+  roi_count: 64
+  latent_dim: 16
+  hidden_width: 128
+  attention_heads: 4
+  bottleneck_depth: 2
+  ffn_dim: 256
+  dropout: 0.1
+  beta_kl: 0.001
+  spectral_weight: 0.1
+  resblock_depth: 1
+  tcorr_weight: 0.0
+  fc_weight: 0.0
+training:
+  batch_size: 16
+  gradient_accumulation_steps: 1
+  num_workers: 0
+  epochs: 25
+  learning_rate: 0.001
+  weight_decay: 0.01
+  samples_per_epoch: 512
+  scheduler: none
+  min_learning_rate: 0.0
+  test_interval: null

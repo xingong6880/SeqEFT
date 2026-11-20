@@ -1,0 +1,25 @@
+# 本地数据、预训练权重与训练结果
+data/
+checkpoints/
+outputs/
+*.pt
+*.pth
+*.npy
+*.npz
+*.pkl
+*.h5
+*.hdf5
+evaluation*.json
+
+# Python 与临时验证
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+.validation/
+build/
+dist/
+.DS_Store
+.env
+.env.*

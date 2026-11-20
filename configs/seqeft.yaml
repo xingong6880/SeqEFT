@@ -1,0 +1,50 @@
+# Stage 2：论文主结果 FC0.1 + EMA，固定第 150 epoch 的 EMA。
+# 三个训练种子：20261012、20261013、20261014；每个 seed 使用独立输出目录。
+experiment:
+  name: seqeft
+  seed: 20261012
+  output_root: outputs/seqeft_seed20261012
+data:
+  cache_root: data/cache/resting_state
+  split_file: configs/splits/resting_state.yaml
+  window_length: 512
+  roi_count: 64
+model:
+  labram_checkpoint: checkpoints/labram-base.pth
+  bold_vae_checkpoint: outputs/vae/last.pt
+  input_scale: 0.01
+  hidden_dim: 256
+  frame_chunk_size: 16
+  train_labram: true
+  slots_per_branch: 8
+  tokenizer_depth: 2
+  temporal_token_count: 416
+  spectral_token_count: 832
+  feature_dim: 200
+  context_radius: 2
+  mixer_depth: 4
+  heads: 8
+  mixer_ffn_dim: 1024
+  local_expansion_dim: 512
+  local_kernel_size: 5
+  dropout: 0.1
+  latent_dim: 16
+training:
+  batch_size: 8
+  gradient_accumulation_steps: 1
+  drop_last: false
+  num_workers: 0
+  epochs: 150
+  updates_per_epoch: 3
+  main_learning_rate: 0.0003
+  eeg_learning_rate: 0.0001
+  pretrained_labram_learning_rate: 0.00001
+  weight_decay: 0.01
+  grad_clip_norm: 1.0
+  warmup_epochs: 5
+  min_learning_rate: 0.0
+  precision: fp32
+  ema_decay: 0.99
+loss:
+  latent_mse_weight: 1.0
+  fc_weight: 0.1
