@@ -1,10 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-only
-# 从论文研究实现移入；仅调整包内导入和公开说明，保留计算与参数名称。
-"""SeqEFT 的 multi-scale spectral EEG encoder。
-
-结构同步 NeuroBOLT 的 MSS：对 16 秒 EEG 使用四尺度 STFT，将每个尺度统一为
-32 个 200 维 tokens，再用 linear-attention 汇总 26 个通道的 832 个 tokens。
-"""
+"""Encode 16-second EEG windows with four STFT scales and linear attention."""
 
 import math
 import warnings
@@ -15,7 +10,7 @@ from torch import nn
 
 
 class PatchFrequencyEmbedding(nn.Module):
-    """把一个 STFT window 的 frequency bins 投影到 feature width。"""
+    """Project spectral bins to the model width."""
 
     def __init__(self, frequency_bins: int, width: int) -> None:
         super().__init__()
@@ -26,7 +21,7 @@ class PatchFrequencyEmbedding(nn.Module):
 
 
 class PatchWindowEmbedding(nn.Module):
-    """把不同尺度的 STFT window 数统一投影成 32 个 tokens。"""
+    """Project the time-window axis to 32 tokens."""
 
     def __init__(self, source_windows: int, target_windows: int = 32) -> None:
         super().__init__()
@@ -38,7 +33,7 @@ class PatchWindowEmbedding(nn.Module):
 
 
 class SinusoidalPositionEncoding(nn.Module):
-    """固定 sinusoidal position，加法后应用与 MSS 一致的 dropout。"""
+    """Apply fixed sinusoidal positions and dropout."""
 
     def __init__(
         self,
@@ -63,7 +58,7 @@ class SinusoidalPositionEncoding(nn.Module):
 
 
 class MultiScaleSpectralEncoder(nn.Module):
-    """四尺度 STFT + linear attention，输出一个 200 维 window feature。"""
+    """Encode 26 EEG channels as 200-dimensional spectral tokens."""
 
     FFT_SCALES = (100, 200, 400, 800)
     SOURCE_WINDOWS = (32, 16, 8, 4)
@@ -77,7 +72,7 @@ class MultiScaleSpectralEncoder(nn.Module):
     ) -> None:
         super().__init__()
         if (width, channels, input_length) != (200, 26, 3200):
-            raise ValueError("本轮 MSS 固定 width/channels/input_length=200/26/3200")
+            raise ValueError("The spectral encoder requires width=200, channels=26, and input_length=3200")
         self.width = width
         self.channels = channels
         self.input_length = input_length
@@ -118,7 +113,7 @@ class MultiScaleSpectralEncoder(nn.Module):
     @staticmethod
     def _stft_magnitude(sample: torch.Tensor, n_fft: int) -> torch.Tensor:
         if sample.ndim != 3 or sample.shape[1] != 1:
-            raise ValueError("STFT sample 必须是 [batch,1,time]")
+            raise ValueError("STFT input must have shape [batch, 1, time]")
         with warnings.catch_warnings():
             warnings.filterwarnings(
                 "ignore",
@@ -138,18 +133,13 @@ class MultiScaleSpectralEncoder(nn.Module):
         return spectrum.abs()
 
     def forward_tokens(self, eeg: torch.Tensor) -> torch.Tensor:
-        """返回 MSS transformer 后的逐 token 特征 ``[NB,832,200]``。
-
-        新版 EEG condition encoder 需要在任务相关 pooling 之前保留
-        channel/window 结构；旧的 ``forward()`` 仍然通过这里的结果做均值，
-        因而不会改变历史调用方的 ``[NB,200]`` 输出合同。
-        """
+        """Return [NB, 832, 200] features before pooling."""
         if eeg.ndim != 3 or tuple(eeg.shape[1:]) != (
             self.channels,
             self.input_length,
         ):
             raise ValueError(
-                "MSS 输入必须是 [NB,26,3200]，实际为 {}".format(
+                "Expected spectral encoder input shape [NB, 26, 3200], got {}".format(
                     tuple(eeg.shape)
                 )
             )
@@ -180,5 +170,5 @@ class MultiScaleSpectralEncoder(nn.Module):
         return self.transformer(tokens)
 
     def forward(self, eeg: torch.Tensor) -> torch.Tensor:
-        """返回 legacy mean-pooled MSS feature ``[NB,200]``。"""
+        """Return a mean-pooled spectral feature for each window."""
         return self.forward_tokens(eeg).mean(dim=1)

@@ -1,6 +1,4 @@
-# 固定受试者独立划分：24 scans / 17 人训练，5 scans / 5 人评价。
-# 原划分于 2026-10-01 固定；五人评价集在开发过程中被多次使用。
-# test 保留为代码字段名；它在研究流程中的角色是 development evaluation。
+# Participant-disjoint split with 24 training scans and 5 development evaluation scans.
 train:
   - sub01-scan01
   - sub02-scan01

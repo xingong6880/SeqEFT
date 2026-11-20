@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-only
-# 从论文研究实现移入；仅调整包内导入和公开说明，保留计算与参数名称。
-"""冻结 fMRI VAE 的加载、检查与 SeqEFT 输出结构。"""
+"""Frozen BOLD VAE loading and model outputs."""
 
 from __future__ import annotations
 
@@ -16,7 +15,6 @@ from .bold_vae import BOLDVAE, BOLDVAEConfig
 
 
 def _validate_bold_vae_config(config: BOLDVAEConfig) -> None:
-    """检查 EEG2BOLD V0 使用的 fixed V0-B latent contract。"""
     expected = {
         "input_length": 512,
         "latent_length": 256,
@@ -27,7 +25,7 @@ def _validate_bold_vae_config(config: BOLDVAEConfig) -> None:
     for name, value in expected.items():
         if getattr(config, name, None) != value:
             raise ValueError(
-                "BOLD-VAE V0-B contract 要求 {}={}，实际为 {}".format(
+                "The reference BOLD VAE requires {}={}, got {}".format(
                     name,
                     value,
                     getattr(config, name, None),
@@ -54,7 +52,7 @@ def _validate_checkpoint_metadata(
     payload: object,
     config: BOLDVAEConfig,
 ) -> None:
-    """校验 checkpoint 保存的 architecture metadata，避免同 shape 错配。"""
+    """Check architecture metadata that tensor shapes alone cannot validate."""
     if not isinstance(payload, Mapping):
         return
 
@@ -85,7 +83,7 @@ def _validate_checkpoint_metadata(
 
 
 def _freeze_eval(module: nn.Module) -> None:
-    """冻结参数，并保证 dropout/normalization 不随父模型切回 train。"""
+    """Freeze module parameters and enter evaluation mode."""
     for parameter in module.parameters():
         parameter.requires_grad_(False)
     module.eval()
@@ -97,7 +95,7 @@ def load_frozen_bold_vae(
     *,
     device: Optional[torch.device] = None,
 ) -> BOLDVAE:
-    """严格加载 V0-B BOLD-VAE checkpoint；不存在或不匹配时直接失败。"""
+    """Load and validate a compatible state dictionary for the frozen BOLD VAE."""
     if config is None:
         config = BOLDVAEConfig(
             input_length=512,
@@ -107,7 +105,7 @@ def load_frozen_bold_vae(
     _validate_bold_vae_config(config)
     path = Path(checkpoint_path)
     if not path.is_file():
-        raise FileNotFoundError("BOLD-VAE checkpoint 不存在: {}".format(path))
+        raise FileNotFoundError("BOLD VAE checkpoint does not exist: {}".format(path))
 
     model = BOLDVAE(config)
     payload = torch.load(path, map_location="cpu", weights_only=False)
@@ -119,7 +117,7 @@ def load_frozen_bold_vae(
     else:
         state = payload
     if not isinstance(state, Mapping):
-        raise RuntimeError("BOLD-VAE checkpoint 不包含可用的 state dict")
+        raise RuntimeError("The BOLD VAE checkpoint has no usable state dictionary")
     model.load_state_dict(state, strict=True)
     _freeze_eval(model)
     if device is not None:
@@ -130,7 +128,7 @@ def load_frozen_bold_vae(
 
 @dataclass
 class EEG2BOLDOutput:
-    """总模型输出；同时支持属性访问和简单的 key 访问。"""
+    """Predicted latents and BOLD, with optional target latents and shape trace."""
 
     z_pred: torch.Tensor
     bold_pred: torch.Tensor

@@ -1,4 +1,4 @@
-# Stage 1：固定 25 epochs / 800 updates，仅使用训练集。
+# Stage 1: Pretrain the fMRI VAE on training scans.
 experiment:
   name: seqeft_vae
   seed: 2026

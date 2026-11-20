@@ -1,8 +1,4 @@
-"""SeqEFT 的只读缓存与固定 512 帧数据集。
-
-一个 dataset index 对应一条 scan。训练时随机选择连续窗口；评估时只取
-每条 scan 的中心窗口。EEG、BOLD 与帧号始终用同一位置裁剪。
-"""
+"""Read-only scan caches and synchronized 512-frame windows."""
 from __future__ import annotations
 
 import json
@@ -22,7 +18,7 @@ EEG_SHAPE = (26, 16, 200)
 
 @dataclass(frozen=True)
 class CachedBOLDScan:
-    """只保存缓存路径和身份；数组以只读 mmap 方式加载。"""
+    """Scan identity and paths to memory-mapped arrays."""
 
     root: Path
     bold_path: Path
@@ -35,40 +31,39 @@ class CachedBOLDScan:
 
 
 def load_split_manifest(path) -> dict:
-    """读取划分并拒绝重复 scan 或跨集合的同一受试者。"""
+    """Load a split with unique scans and participant-disjoint sets."""
     with Path(path).open(encoding="utf-8") as stream:
         manifest = yaml.safe_load(stream)
     names = set(manifest) if isinstance(manifest, dict) else set()
     if names not in ({"train", "test"}, {"train", "val", "test"}):
-        raise ValueError("split 必须包含 train/test，或 train/val/test")
+        raise ValueError("The manifest must contain train and test splits, with optional val")
     seen_scans, seen_subjects = set(), set()
     for split in ("train", "val", "test"):
         if split not in manifest:
             continue
         scans = manifest[split]
         if not isinstance(scans, list) or not all(isinstance(x, str) for x in scans):
-            raise ValueError("split 中必须是 scan_id 字符串列表")
+            raise ValueError("Each split must contain a list of scan ID strings")
         if len(set(scans)) != len(scans) or seen_scans.intersection(scans):
-            raise ValueError("split 包含重复 scan")
+            raise ValueError("The manifest contains a duplicate scan")
         subjects = {scan.split("-", 1)[0] for scan in scans}
         if seen_subjects.intersection(subjects):
-            raise ValueError("同一受试者不能出现在多个 split")
+            raise ValueError("The same participant appears in multiple splits")
         seen_scans.update(scans)
         seen_subjects.update(subjects)
     return manifest
 
 
 def load_existing_bold_caches(config, split="train"):
-    """按配置读取缓存身份；兼容字典配置与旧版 namespace 配置。
+    """Load cache handles from a mapping or namespace config.
 
-    两路划分可以复用旧缓存的 train/val/test 标签，实际成员以 split YAML
-    为准。这个映射只改变内存中的 handle，不会修改缓存。
+    Two-way manifests may reuse caches from older train/val/test splits.
     """
     data = config["data"] if isinstance(config, dict) else config.data
     field = lambda name: data[name] if isinstance(data, dict) else getattr(data, name)
     manifest = load_split_manifest(field("split_file"))
     if split not in manifest:
-        raise ValueError("所请求 split 不在划分文件中")
+        raise ValueError("The requested split is missing from the manifest")
     cache_root = Path(field("cache_root"))
     caches = []
     for scan_id in manifest[split]:
@@ -77,36 +72,34 @@ def load_existing_bold_caches(config, split="train"):
             metadata = json.load(stream)
         subject_id = scan_id.split("-", 1)[0]
         if metadata["scan_id"] != scan_id or metadata["subject_id"] != subject_id:
-            raise ValueError("缓存 scan/subject 身份与 split 不一致: " + scan_id)
+            raise ValueError("Cache identity does not match the manifest: " + scan_id)
         cache_split = metadata["split"]
         if cache_split not in {"train", "val", "test"}:
-            raise ValueError("缓存 split 标签无效: " + scan_id)
+            raise ValueError("Invalid cache split label: " + scan_id)
         if "val" in manifest and cache_split != split:
-            raise ValueError("缓存 split 与三路 manifest 不一致: " + scan_id)
+            raise ValueError("Cache split does not match the three-way manifest: " + scan_id)
         cache = CachedBOLDScan(
             root, root / "bold.npy", root / "frame_index.npy",
             subject_id, scan_id, split, int(metadata["length"]),
             metadata.get("cache_version"),
         )
-        # 与原始 loader 一样，先检查文件可读及 metadata.length 一致。
         bold = np.load(cache.bold_path, mmap_mode="r", allow_pickle=False)
         np.load(cache.frame_index_path, mmap_mode="r", allow_pickle=False)
         if bold.shape[0] != cache.length:
-            raise ValueError("缓存 length 与数组不一致: " + scan_id)
+            raise ValueError("Cache length does not match the BOLD array: " + scan_id)
         caches.append(cache)
     return caches
 
 
 def load_existing_paired_caches(config, split="train"):
-    """EEG 与 BOLD 共用同一份 scan handle 和划分。"""
     return load_existing_bold_caches(config, split=split)
 
 
 def contiguous_runs(frame_index):
-    """返回连续帧号对应的数组位置区间 [start, end)。"""
+    """Return half-open array intervals with consecutive frame indices."""
     frames = np.asarray(frame_index)
     if frames.ndim != 1:
-        raise ValueError("frame_index 必须是一维数组")
+        raise ValueError("frame_index must be one-dimensional")
     if not frames.size:
         return []
     points = [0] + (np.flatnonzero(np.diff(frames) != 1) + 1).tolist() + [len(frames)]
@@ -114,9 +107,9 @@ def contiguous_runs(frame_index):
 
 
 def valid_window_starts(frame_index, window_length=512):
-    """枚举完整且不跨越帧号断点的窗口起点。"""
+    """List start indices for windows with consecutive frames."""
     if isinstance(window_length, bool) or not isinstance(window_length, int) or window_length <= 0:
-        raise ValueError("window_length 必须是正整数")
+        raise ValueError("window_length must be a positive integer")
     return [
         start
         for first, end in contiguous_runs(frame_index)
@@ -125,11 +118,11 @@ def valid_window_starts(frame_index, window_length=512):
 
 
 class _WindowDataset(Dataset):
-    """共享只读数组、scan 身份及同步裁剪逻辑。"""
+    """Validate scan arrays and crop them at the same indices."""
 
     def __init__(self, caches: Sequence, *, paired: bool):
         if not caches:
-            raise ValueError("至少需要一个 scan cache")
+            raise ValueError("At least one scan cache is required")
         self.paired = paired
         self._records = []
         for cache in caches:
@@ -144,20 +137,20 @@ class _WindowDataset(Dataset):
                     arrays[name] = np.load(path, mmap_mode="r", allow_pickle=False)
             bold, frames = arrays["bold"], arrays["frame_index"]
             if bold.ndim != 2 or bold.shape[1] != ROI_COUNT:
-                raise ValueError("BOLD 必须为 [T,64]")
+                raise ValueError("BOLD must have shape [T, 64]")
             if frames.shape != (len(bold),) or not np.issubdtype(frames.dtype, np.integer):
-                raise ValueError("frame_index 必须为同长度的一维整数数组")
+                raise ValueError("frame_index must be a one-dimensional integer array of length T")
             if not np.isfinite(bold).all():
-                raise ValueError("BOLD 必须全部为有限值")
+                raise ValueError("BOLD must contain only finite values")
             if getattr(cache, "length", len(bold)) != len(bold):
-                raise ValueError("缓存 length 与数组不一致")
+                raise ValueError("Cache length does not match the arrays")
             if paired:
                 eeg = arrays["eeg"]
                 if eeg.shape != (len(bold),) + EEG_SHAPE or not np.isfinite(eeg).all():
-                    raise ValueError("EEG 必须为有限的 [T,26,16,200] 数组")
+                    raise ValueError("EEG must be a finite array with shape [T, 26, 16, 200]")
             starts = tuple(valid_window_starts(frames))
             if not starts:
-                raise ValueError("scan {} 不包含完整的连续 512 帧窗口".format(cache.scan_id))
+                raise ValueError("Scan {} has no contiguous 512-frame window".format(cache.scan_id))
             self._records.append((cache, arrays, starts))
 
     def __len__(self):
@@ -174,7 +167,7 @@ class _WindowDataset(Dataset):
     def _sample(self, index, start):
         cache, arrays, starts = self._records[index]
         if start not in starts:
-            raise ValueError("窗口起点不合法")
+            raise ValueError("Invalid window start")
         sample = {
             key: torch.from_numpy(np.array(value[start:start + WINDOW_LENGTH],
                 dtype=np.int64 if key == "frame_index" else np.float32, copy=True))
@@ -188,7 +181,7 @@ class _WindowDataset(Dataset):
 
 
 class _RandomWindowDataset(_WindowDataset):
-    """保留论文实现的 seed/epoch/worker 混合规则及 NumPy choice 顺序。"""
+    """Sample windows using the reference seed, epoch, and worker sequence."""
 
     def __init__(self, caches, *, seed, paired):
         super().__init__(caches, paired=paired)
@@ -215,24 +208,24 @@ class _RandomWindowDataset(_WindowDataset):
 
 
 class RandomPairedWindowDataset(_RandomWindowDataset):
-    """Stage 2：每次访问一条 scan，随机裁剪配对 EEG/BOLD。"""
+    """Sample one paired EEG and BOLD window from a scan."""
 
     def __init__(self, caches, *, seed=20261012):
         super().__init__(caches, seed=seed, paired=True)
 
 
 class RandomFixedWindowBOLDDataset(_RandomWindowDataset):
-    """Stage 1：只读取 BOLD，保持一个 scan 对应一个 dataset index。"""
+    """Sample one BOLD window from a scan."""
 
     def __init__(self, caches, *, window_length=512, roi_count=64, seed=2026):
         if window_length != 512 or roi_count != 64:
-            raise ValueError("公开配置固定 window_length=512、roi_count=64")
+            raise ValueError("The reference VAE requires window_length=512 and roi_count=64")
         self.window_length, self.roi_count = window_length, roi_count
         super().__init__(caches, seed=seed, paired=False)
 
 
 class CenterPairedWindowDataset(_WindowDataset):
-    """每条 scan 取唯一连续序列的中心 512 帧，拒绝跨断点评估。"""
+    """Take the center 512 frames of each contiguous scan."""
 
     def __init__(self, caches):
         super().__init__(caches, paired=True)
@@ -240,11 +233,11 @@ class CenterPairedWindowDataset(_WindowDataset):
         for _, arrays, valid in self._records:
             runs = contiguous_runs(arrays["frame_index"])
             if len(runs) != 1:
-                raise ValueError("中心窗口要求整条 scan 的 frame_index 连续")
+                raise ValueError("Center-window evaluation requires consecutive frame indices throughout the scan")
             first, end = runs[0]
             start = first + (end - first - WINDOW_LENGTH) // 2
             if start not in valid:
-                raise ValueError("中心窗口不足 512 帧")
+                raise ValueError("The center window is shorter than 512 frames")
             self._starts.append(start)
 
     @property
@@ -256,9 +249,9 @@ class CenterPairedWindowDataset(_WindowDataset):
 
 
 def paired_collate(samples):
-    """将同一字段堆叠为 batch，字符串身份仍保留为列表。"""
+    """Stack tensor fields and retain lists of scan identifiers."""
     if not samples:
-        raise ValueError("不能 collate 空列表")
+        raise ValueError("Cannot collate an empty batch")
     batch = {}
     for key in ("eeg", "bold", "frame_index", "scan_id", "subject_id", "split", "start"):
         values = [sample[key] for sample in samples]

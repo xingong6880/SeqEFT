@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-only
-# 从论文研究实现移入；仅调整包内导入和公开说明，保留计算与参数名称。
-"""Hybrid V1 的 overlapping local EEG-to-latent grounding。"""
+"""Overlapping local attention from BOLD latent positions to EEG frames."""
 
 from __future__ import annotations
 
@@ -12,7 +11,6 @@ from torch import nn
 
 @dataclass(frozen=True)
 class HybridGroundingConfig:
-    """固定的 local grounding shape contract。"""
 
     hidden_dim: int = 256
     heads: int = 8
@@ -32,27 +30,23 @@ class HybridGroundingConfig:
         ):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-                raise ValueError("{} 必须是正整数".format(name))
+                raise ValueError("{} must be a positive integer".format(name))
         if isinstance(self.context_radius, bool) or not isinstance(self.context_radius, int):
-            raise ValueError("context_radius 必须是非负整数")
+            raise ValueError("context_radius must be a nonnegative integer")
         if self.context_radius < 0:
-            raise ValueError("context_radius 必须是非负整数")
+            raise ValueError("context_radius must be a nonnegative integer")
         if self.input_length != 512 or self.output_length != 256:
-            raise ValueError("Hybrid grounding 固定为 512 -> 256")
+            raise ValueError("Grounding requires 512 EEG frames and 256 latent steps")
         if self.input_length != self.output_length * 2:
-            raise ValueError("input_length 必须是 output_length 的两倍")
+            raise ValueError("input_length must be twice output_length")
         if self.hidden_dim % self.heads != 0:
-            raise ValueError("hidden_dim 必须能被 heads 整除")
+            raise ValueError("hidden_dim must be divisible by heads")
         if not 0.0 <= float(self.dropout) < 1.0:
-            raise ValueError("dropout 必须位于 [0,1)")
+            raise ValueError("dropout must be in [0, 1)")
 
 
 class OverlappingLocalCrossAttention(nn.Module):
-    """让每个 BOLD latent position 读取 overlapping EEG local window。
-
-    窗口使用固定长度，越过序列边界的 token 由 ``key_padding_mask`` 屏蔽。
-    这样既保持 batch shape，又不会通过 clipping 重复边界 frame 或产生 wrap-around。
-    """
+    """Attend over a fixed window around each latent position and mask out-of-range frames."""
 
     def __init__(
         self,
@@ -61,7 +55,7 @@ class OverlappingLocalCrossAttention(nn.Module):
     ) -> None:
         super().__init__()
         if config is not None and config_kwargs:
-            raise TypeError("传入 config 后不能再传 grounding 配置关键字")
+            raise TypeError("Pass either config or grounding keyword settings")
         self.config = config or HybridGroundingConfig(**config_kwargs)
         width = self.config.hidden_dim
         self.position_queries = nn.Parameter(
@@ -85,7 +79,7 @@ class OverlappingLocalCrossAttention(nn.Module):
         self.register_buffer("window_offsets", offsets, persistent=False)
 
     def window_indices_and_mask(self, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
-        """返回 ``[256,W]`` frame indices 与 ``[256,W*K]`` invalid mask。"""
+        """Return window indices and the mask for out-of-range EEG slots."""
         centers = torch.arange(
             self.config.output_length,
             device=device,
@@ -93,7 +87,7 @@ class OverlappingLocalCrossAttention(nn.Module):
         ).mul(2).unsqueeze(1)
         raw_indices = centers + self.window_offsets.to(device).unsqueeze(0)
         valid = (raw_indices >= 0) & (raw_indices < self.config.input_length)
-        # 仅为满足 gather 的固定 shape 做 clipping；所有无效位置都会被 mask。
+        # Clamp for safe indexing. The mask hides all out-of-range entries.
         indices = raw_indices.clamp(0, self.config.input_length - 1)
         invalid = (~valid).unsqueeze(-1).expand(
             -1,
@@ -102,8 +96,11 @@ class OverlappingLocalCrossAttention(nn.Module):
         )
         return indices, invalid.reshape(self.config.output_length, -1)
 
+    def make_query(self, value: torch.Tensor) -> torch.Tensor:
+        return self.query_norm(self.position_queries).expand(value.shape[0], -1, -1)
+
     def forward(self, value: torch.Tensor) -> torch.Tensor:
-        """将 ``[B,512,16,D]`` 映射为 ``[B,256,D]``。"""
+        """Map [B, 512, slots, D] EEG tokens to [B, 256, D] latents."""
         expected = (
             self.config.input_length,
             self.config.slots_per_frame,
@@ -111,7 +108,7 @@ class OverlappingLocalCrossAttention(nn.Module):
         )
         if not torch.is_tensor(value) or value.ndim != 4 or tuple(value.shape[1:]) != expected:
             raise ValueError(
-                "local grounding 输入必须是 [B,512,{},{}]，实际为 {}".format(
+                "Expected grounding input shape [B, 512, {}, {}], got {}".format(
                     self.config.slots_per_frame,
                     self.config.hidden_dim,
                     tuple(value.shape) if torch.is_tensor(value) else type(value),
@@ -128,8 +125,9 @@ class OverlappingLocalCrossAttention(nn.Module):
             self.config.hidden_dim,
         )
         key = self.key_norm(local)
-        query = self.query_norm(self.position_queries).expand(batch, -1, -1)
-        query = query.reshape(batch * self.config.output_length, 1, self.config.hidden_dim)
+        query = self.make_query(value).reshape(
+            batch * self.config.output_length, 1, self.config.hidden_dim
+        )
         key_padding_mask = invalid.unsqueeze(0).expand(batch, -1, -1).reshape(
             batch * self.config.output_length,
             -1,
@@ -149,9 +147,53 @@ class OverlappingLocalCrossAttention(nn.Module):
         )
 
 
+class ContentQueryGrounding(OverlappingLocalCrossAttention):
+    """Combine position queries with projected EEG features from adjacent frame pairs."""
+
+    def __init__(self, config: HybridGroundingConfig | None = None, **config_kwargs) -> None:
+        super().__init__(config, **config_kwargs)
+        self.content_projection = nn.Linear(
+            2 * self.config.hidden_dim,
+            self.config.hidden_dim,
+            bias=False,
+        )
+        nn.init.zeros_(self.content_projection.weight)
+
+    @classmethod
+    def from_position_grounding(
+        cls, grounding: OverlappingLocalCrossAttention
+    ) -> "ContentQueryGrounding":
+        """Copy the base attention weights while preserving the caller's RNG state."""
+        if not isinstance(grounding, OverlappingLocalCrossAttention):
+            raise TypeError("grounding must be an OverlappingLocalCrossAttention module")
+        with torch.random.fork_rng(devices=[]):
+            result = cls(grounding.config)
+        loaded = result.load_state_dict(grounding.state_dict(), strict=False)
+        if loaded.missing_keys != ["content_projection.weight"] or loaded.unexpected_keys:
+            raise RuntimeError("Content grounding and position grounding have different shared parameters")
+        return result
+
+    @staticmethod
+    def pair_frame_content(value: torch.Tensor) -> torch.Tensor:
+        """Concatenate the mean token features of each ordered pair of EEG frames."""
+        frame_content = value.mean(dim=2)
+        return torch.cat(
+            (frame_content[:, 0::2], frame_content[:, 1::2]), dim=-1
+        )
+
+    def make_query(self, value: torch.Tensor) -> torch.Tensor:
+        """Add the frame-pair projection to each latent position query."""
+        paired_content = self.pair_frame_content(value)
+        content = self.content_projection(paired_content)
+        return self.query_norm(self.position_queries + content).expand(
+            value.shape[0], -1, -1
+        )
+
+
 HybridLocalGrounding = OverlappingLocalCrossAttention
 
 __all__ = [
+    "ContentQueryGrounding",
     "HybridGroundingConfig",
     "HybridLocalGrounding",
     "OverlappingLocalCrossAttention",

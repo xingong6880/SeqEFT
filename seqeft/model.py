@@ -1,4 +1,4 @@
-"""构造论文使用的 SeqEFT；保留历史 checkpoint 的参数名称与初始化顺序。"""
+"""Build the SeqEFT reference model."""
 
 from __future__ import annotations
 
@@ -9,15 +9,20 @@ import numpy as np
 import torch
 
 from .models.bold_vae import BOLDVAE, BOLDVAEConfig
-from .models.content_query_grounding import ContentQueryGrounding
 from .models.eeg2bold_model import load_frozen_bold_vae
-from .models.hybrid_eeg2bold_model import HybridEEG2BOLDLatentModel
+from .models.hybrid_eeg2bold_model import HybridEEG2BOLDLatentModel, HybridLatentProjectionHead
 from .models.hybrid_eeg_tokenizer import HybridEEGTokenizer, HybridTokenizerConfig
-from .models.hybrid_grounding import HybridGroundingConfig, OverlappingLocalCrossAttention
-from .models.hybrid_latent_head import HybridLatentProjectionHead
-from .models.hybrid_latent_mixer import HybridLatentMixerConfig, HybridLatentTemporalMixer
+from .models.hybrid_grounding import (
+    ContentQueryGrounding,
+    HybridGroundingConfig,
+    OverlappingLocalCrossAttention,
+)
+from .models.hybrid_latent_mixer import (
+    HybridLatentMixerConfig,
+    HybridLatentTemporalMixer,
+    LocalOnlyLatentTemporalMixer,
+)
 from .models.labram import LaBraMTemporalEncoder
-from .models.local_only_latent_mixer import LocalOnlyLatentTemporalMixer
 from .models.spectral import MultiScaleSpectralEncoder
 
 
@@ -25,7 +30,7 @@ SeqEFT = HybridEEG2BOLDLatentModel
 
 
 def seed_everything(seed: int) -> None:
-    """同步 Python、NumPy 和 PyTorch 随机种子。"""
+    """Seed Python, NumPy, and PyTorch."""
     random.seed(int(seed))
     np.random.seed(int(seed) % (2**32))
     torch.manual_seed(int(seed))
@@ -39,12 +44,7 @@ def build_model(
     *,
     load_pretrained: bool = True,
 ) -> SeqEFT:
-    """构造 Content Query + Local-only 模型，并冻结 fMRI VAE。
-
-    默认加载 LaBraM 与 Stage 1 VAE 权重。只有验证或即将严格加载完整
-    SeqEFT checkpoint 时才使用 load_pretrained=False；该模式不提供训练权重。
-    config 使用公开 YAML 的 experiment 和 model 两个字典。
-    """
+    """Build SeqEFT with a frozen VAE. Skip pretrained weights for full checkpoint loads."""
     settings = config.get("model", {})
     seed_everything(config.get("experiment", {}).get("seed", 20261012))
     width = settings.get("hidden_dim", 256)
@@ -72,7 +72,7 @@ def build_model(
         )
         bold_vae = load_frozen_bold_vae(Path(settings["bold_vae_checkpoint"]))
     else:
-        # 与 from_checkpoint 保持同样的构造顺序，MSS 独立使用原始固定种子。
+        # Use the same spectral initialization as the pretrained path.
         temporal = LaBraMTemporalEncoder()
         with torch.random.fork_rng(devices=[]):
             torch.manual_seed(2026)
@@ -87,8 +87,7 @@ def build_model(
             BOLDVAEConfig(input_length=512, latent_length=256, temporal_compression=2)
         )
 
-    # 先按论文实验初始化公共模型，再移除 global mixer attention。
-    # 直接初始化简化网络会改变 RNG 消耗，从而改变随后模块的初值。
+    # Construct the original mixer before removing global attention to preserve the RNG sequence.
     grounding = OverlappingLocalCrossAttention(
         HybridGroundingConfig(
             hidden_dim=width,

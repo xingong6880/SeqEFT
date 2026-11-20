@@ -1,5 +1,4 @@
-# Stage 2：论文主结果 FC0.1 + EMA，固定第 150 epoch 的 EMA。
-# 三个训练种子：20261012、20261013、20261014；每个 seed 使用独立输出目录。
+# Stage 2: EEG alignment with ConnMSE and evaluation using the final EMA checkpoint.
 experiment:
   name: seqeft
   seed: 20261012

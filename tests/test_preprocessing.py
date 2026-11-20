@@ -1,4 +1,4 @@
-"""用合成信号验证原始预处理合同，不需要 EEG/fMRI 数据集。"""
+"""Check reference preprocessing using synthetic signals."""
 
 import numpy as np
 import pytest
@@ -86,7 +86,7 @@ def test_eeg_baseline_precedes_crop_and_selection_preserves_volume_indices():
     assert tuple(raw.ch_names) == VU_CHANNELS
     assert eeg.shape == (3, 26, 16, 200)
     assert eeg.dtype == np.float32
-    # raw 已由被测函数重排和滤波；独立计算包含 t=0 的 3201 点 baseline。
+    # Recompute baseline correction over all 3,201 samples of each filtered epoch.
     for index, onset in enumerate((17.0, 19.1, 21.2)):
         end = round(onset * sfreq)
         epoch = raw.get_data(start=end - 3200, stop=end + 1)

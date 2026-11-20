@@ -1,4 +1,4 @@
-"""固定划分、同步裁剪与指标边界的公开合成测试。"""
+"""Test split validation, synchronized crops, and scan metrics."""
 from types import SimpleNamespace
 
 import numpy as np
@@ -24,7 +24,7 @@ def cache(tmp_path, paired=False):
 def test_split_rejects_subject_leakage(tmp_path):
     path = tmp_path / "split.yaml"
     path.write_text("train: [sub01-scan01]\ntest: [sub01-scan02]\n")
-    with pytest.raises(ValueError, match="受试者"):
+    with pytest.raises(ValueError, match="participant"):
         load_split_manifest(path)
 
 

@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-only
-# 从论文研究实现移入；仅调整包内导入和公开说明，保留计算与参数名称。
-"""SeqEFT 的 LaBraM temporal encoder 与严格 checkpoint 加载器。"""
+"""LaBraM temporal encoder and checkpoint loader."""
 
 from dataclasses import dataclass
 import hashlib
@@ -12,8 +11,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-# VU_CHANNELS 在 LaBraM 的 128-channel absolute position table 中的固定位置。
-# 0 是 CLS position；后 26 项与 dataset.contracts.VU_CHANNELS 逐项对应。
+# Indices in LaBraM's channel position table, starting with CLS.
 LABRAM_VU_INPUT_INDICES = (
     0, 1, 3, 18, 22, 40, 44, 62, 66, 81, 83, 16, 24,
     38, 46, 60, 68, 2, 20, 42, 64, 75, 82, 26, 36, 48, 58,
@@ -25,7 +23,7 @@ def _drop_path(
     probability: float,
     training: bool,
 ) -> torch.Tensor:
-    """逐样本 stochastic depth；eval 或 probability=0 时保持恒等。"""
+    """Apply stochastic depth independently per sample during training."""
     if probability == 0.0 or not training:
         return value
     keep_probability = 1.0 - probability
@@ -35,7 +33,6 @@ def _drop_path(
 
 
 class DropPath(nn.Module):
-    """把 stochastic depth 封装成 module，保持 block 结构清晰。"""
 
     def __init__(self, probability: float = 0.0) -> None:
         super().__init__()
@@ -46,7 +43,6 @@ class DropPath(nn.Module):
 
 
 class MLP(nn.Module):
-    """LaBraM block 使用的两层 GELU feed-forward network。"""
 
     def __init__(self, width: int, hidden_width: int, dropout: float) -> None:
         super().__init__()
@@ -63,7 +59,7 @@ class MLP(nn.Module):
 
 
 class Attention(nn.Module):
-    """与 LaBraM-base checkpoint 参数布局一致的 multi-head attention。"""
+    """Multi-head attention with the LaBraM-base parameter layout."""
 
     def __init__(
         self,
@@ -76,7 +72,7 @@ class Attention(nn.Module):
     ) -> None:
         super().__init__()
         if width % heads != 0:
-            raise ValueError("temporal width 必须能被 heads 整除")
+            raise ValueError("The temporal width must be divisible by the number of heads")
         self.num_heads = heads
         self.head_dim = width // heads
         self.scale = self.head_dim ** -0.5
@@ -121,7 +117,7 @@ class Attention(nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    """Pre-norm attention/MLP block，含 LaBraM LayerScale 参数。"""
+    """Pre-norm transformer block with LaBraM LayerScale parameters."""
 
     def __init__(
         self,
@@ -160,7 +156,7 @@ class TransformerBlock(nn.Module):
 
 
 class TemporalConv(nn.Module):
-    """把 26×16 个 EEG patch 各自编码成 200 维 token。"""
+    """Encode each of the 416 EEG patches as a 200-dimensional token."""
 
     def __init__(self, out_channels: int = 8) -> None:
         super().__init__()
@@ -204,7 +200,7 @@ class TemporalConv(nn.Module):
 
 
 class LaBraMTemporalEncoder(nn.Module):
-    """SeqEFT 本地、与 LaBraM-base 221-key checkpoint 兼容的 trunk。"""
+    """Temporal trunk compatible with LaBraM-base checkpoints."""
 
     def __init__(
         self,
@@ -270,12 +266,12 @@ class LaBraMTemporalEncoder(nn.Module):
     ) -> torch.Tensor:
         if eeg.ndim != 4 or tuple(eeg.shape[1:]) != (26, 16, 200):
             raise ValueError(
-                "LaBraM temporal 输入必须是 [NB,26,16,200]，实际为 {}".format(
+                "Expected LaBraM input shape [NB, 26, 16, 200], got {}".format(
                     tuple(eeg.shape)
                 )
             )
         if len(input_chans) != 27 or input_chans[0] != 0:
-            raise ValueError("LaBraM channel indices 必须含 CLS 在内共 27 项")
+            raise ValueError("Expected 27 LaBraM channel indices including CLS")
         batch = eeg.shape[0]
         tokens = self.patch_embed(eeg)
         cls = self.cls_token.expand(batch, -1, -1)
@@ -306,7 +302,7 @@ class LaBraMTemporalEncoder(nn.Module):
         eeg: torch.Tensor,
         input_chans: Tuple[int, ...] = LABRAM_VU_INPUT_INDICES,
     ) -> torch.Tensor:
-        """返回逐 patch 的 LayerNorm token feature。"""
+        """Return normalized features for each EEG patch."""
         return self.norm(self._forward_raw_patch_tokens(eeg, input_chans))
 
     def forward(self, eeg: torch.Tensor) -> torch.Tensor:
@@ -322,13 +318,7 @@ def _sha256_path(path: Path) -> str:
 
 @dataclass(frozen=True)
 class CheckpointLoadReport:
-    """记录 core 权重覆盖数与未使用的原 checkpoint keys。
-
-    expected_core: trunk 中属于 core 前缀的 key 数（必须全部被覆盖）。
-    loaded_core:   实际加载的 core key 数（当前恒等于 expected_core）。
-    ignored:       checkpoint 中未被加载的 key（teacher/MSS/head 等），
-                   供审计确认没有把未预训练权重或无关分支混进来。
-    """
+    """Record checkpoint coverage, ignored keys, and file hash."""
 
     expected_core: int
     loaded_core: int
@@ -340,7 +330,7 @@ def load_temporal_checkpoint(
     module: nn.Module,
     checkpoint_path: Path,
 ) -> CheckpointLoadReport:
-    """严格加载 ``student.*`` temporal state；验证完成前不修改 module。"""
+    """Validate the temporal weights before loading them into the module."""
     source = Path(checkpoint_path)
     checkpoint = torch.load(source, map_location="cpu", weights_only=False)
     state = (
@@ -349,7 +339,7 @@ def load_temporal_checkpoint(
         else checkpoint
     )
     if not isinstance(state, Mapping):
-        raise RuntimeError("LaBraM checkpoint 不包含可用的 state dict")
+        raise RuntimeError("The LaBraM checkpoint has no usable state dictionary")
     student = {
         key[len("student."):]: value
         for key, value in state.items()
@@ -372,7 +362,7 @@ def load_temporal_checkpoint(
             )
     if mismatches:
         raise RuntimeError(
-            "LaBraM temporal checkpoint 不匹配：{}".format(
+            "LaBraM temporal checkpoint mismatch: {}".format(
                 "; ".join(mismatches[:10])
             )
         )
@@ -387,41 +377,3 @@ def load_temporal_checkpoint(
         ignored=ignored,
         checkpoint_sha256=_sha256_path(source),
     )
-
-
-class EEGAdapter(nn.Module):
-    """逐 window 将 LaBraM 特征映射到 SeqEFT condition width。
-
-    将本地 EEG encoder 的 200 维融合特征投影到 condition width。
-    """
-
-    def __init__(
-        self,
-        feature_dim: int = 200,
-        width: int = 256,
-        dropout: float = 0.1,
-        adapter_type: str = "mlp",
-    ) -> None:
-        super().__init__()
-        # I-005：linear = LayerNorm + 单层 Linear；mlp = 两层 MLP（默认）。
-        if adapter_type == "linear":
-            self.net = nn.Sequential(
-                nn.LayerNorm(feature_dim),
-                nn.Linear(feature_dim, width),
-            )
-        elif adapter_type == "mlp":
-            self.net = nn.Sequential(
-                nn.LayerNorm(feature_dim),
-                nn.Linear(feature_dim, width),
-                nn.GELU(),
-                nn.Dropout(dropout),
-                nn.Linear(width, width),
-            )
-        else:
-            raise ValueError(
-                "adapter_type 必须是 linear/mlp，实际为 {}".format(adapter_type)
-            )
-
-    def forward(self, features: torch.Tensor) -> torch.Tensor:
-        """保持 batch/block 轴，只变换最后一个 feature 维度。"""
-        return self.net(features)

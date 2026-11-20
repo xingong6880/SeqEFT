@@ -1,4 +1,4 @@
-# 本地数据、预训练权重与训练结果
+# Local data, pretrained weights, and training outputs
 data/
 checkpoints/
 outputs/
@@ -11,7 +11,7 @@ outputs/
 *.hdf5
 evaluation*.json
 
-# Python 与临时验证
+# Python build and test artifacts
 __pycache__/
 *.py[cod]
 *.egg-info/

@@ -1,4 +1,4 @@
-"""Stage 1：只用训练扫描预训练 fMRI 序列 VAE。"""
+"""Stage 1. Pretrain the fMRI sequence VAE on training scans."""
 from __future__ import annotations
 
 import argparse
@@ -15,7 +15,7 @@ from .utils import configure_runtime, load_config, restore_rng, rng_state, save_
 def run(config, device="cuda", resume=None):
     seed, training = config["experiment"]["seed"], config["training"]
     if training.get("gradient_accumulation_steps", 1) != 1 or training.get("num_workers", 0) != 0:
-        raise ValueError("参考协议使用 accumulation=1、num_workers=0")
+        raise ValueError("The reference loop requires gradient_accumulation_steps=1 and num_workers=0")
     configure_runtime(seed)
     device = torch.device(device)
     caches = load_existing_bold_caches(config, split="train")
@@ -33,7 +33,7 @@ def run(config, device="cuda", resume=None):
     if resume:
         payload = torch.load(resume, map_location="cpu", weights_only=False)
         if payload["config"] != config:
-            raise ValueError("恢复训练时配置必须与 checkpoint 完全一致")
+            raise ValueError("The resume config must exactly match the checkpoint config")
         model.load_state_dict(payload["model"], strict=True)
         optimizer.load_state_dict(payload["optimizer"])
         restore_rng(payload["rng"], generator)
@@ -43,7 +43,7 @@ def run(config, device="cuda", resume=None):
         output_dir.mkdir(parents=True, exist_ok=False)
     write_json(output_dir / "config.json", config)
     for epoch in range(start + 1, training["epochs"] + 1):
-        # Stage 1 原始 crop 序列从 epoch=1 开始；Stage 2 从 epoch=0 开始。
+        # The original Stage 1 crop seeds use one-based epochs.
         dataset.set_epoch(epoch)
         model.train()
         sums = torch.zeros(4, device=device)
@@ -51,7 +51,7 @@ def run(config, device="cuda", resume=None):
         for batch in loader:
             result = model(batch["bold"].to(device))
             if not torch.isfinite(result.total_loss):
-                raise ValueError("VAE loss 出现 NaN/Inf")
+                raise ValueError("The VAE loss is not finite")
             result.total_loss.backward()
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
@@ -78,7 +78,7 @@ def main():
     parser.add_argument("--config", default="configs/vae.yaml")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--output-dir")
-    parser.add_argument("--resume", help="同一配置的 last.pt")
+    parser.add_argument("--resume", help="Path to last.pt from a run with the same config")
     args = parser.parse_args()
     config = load_config(args.config)
     if args.output_dir is not None:

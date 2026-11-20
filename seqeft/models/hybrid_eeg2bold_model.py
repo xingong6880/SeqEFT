@@ -1,15 +1,14 @@
 # SPDX-License-Identifier: GPL-3.0-only
-# 从论文研究实现移入；仅调整包内导入和公开说明，保留计算与参数名称。
-"""Hybrid V1 EEG -> BOLD latent 总模型。"""
+"""EEG-to-BOLD model with latent sequence alignment."""
 
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Optional
 
 import torch
 from torch import nn
-from .bold_vae import BOLDVAEConfig
 
+from .bold_vae import BOLDVAEConfig
 from .eeg2bold_model import (
     EEG2BOLDOutput,
     _freeze_eval,
@@ -21,12 +20,36 @@ from .hybrid_grounding import (
     HybridGroundingConfig,
     OverlappingLocalCrossAttention,
 )
-from .hybrid_latent_head import HybridLatentProjectionHead
 from .hybrid_latent_mixer import HybridLatentMixerConfig, HybridLatentTemporalMixer
 
 
+class HybridLatentProjectionHead(nn.Module):
+    """Project each mixed EEG feature into the BOLD latent space."""
+
+    def __init__(
+        self,
+        hidden_dim: int = 256,
+        latent_dim: int = 16,
+        dropout: float = 0.1,
+    ) -> None:
+        super().__init__()
+        if hidden_dim <= 0 or latent_dim <= 0:
+            raise ValueError("hidden_dim and latent_dim must be positive integers")
+        if not 0.0 <= float(dropout) < 1.0:
+            raise ValueError("dropout must be in [0, 1)")
+        self.norm = nn.LayerNorm(hidden_dim)
+        self.hidden_projection = nn.Linear(hidden_dim, hidden_dim)
+        self.activation = nn.GELU()
+        self.dropout = nn.Dropout(dropout)
+        self.output_projection = nn.Linear(hidden_dim, latent_dim)
+
+    def forward(self, value: torch.Tensor) -> torch.Tensor:
+        return self.output_projection(
+            self.dropout(self.activation(self.hidden_projection(self.norm(value))))
+        )
+
+
 class HybridEEG2BOLDLatentModel(nn.Module):
-    """V1-Base 主链路；不修改 V0 的 model/training build path。"""
 
     def __init__(
         self,
@@ -39,11 +62,11 @@ class HybridEEG2BOLDLatentModel(nn.Module):
         super().__init__()
         if eeg_tokenizer is None:
             raise ValueError(
-                "必须显式提供已按 checkpoint 构造的 eeg_tokenizer；测试可注入 fake tokenizer"
+                "Provide an EEG tokenizer"
             )
         if bold_vae is None:
             raise ValueError(
-                "必须显式提供已 strict-load 的 V0-B bold_vae；请先调用 load_frozen_bold_vae"
+                "Provide a BOLD VAE, typically from load_frozen_bold_vae()"
             )
         self.eeg_tokenizer = eeg_tokenizer
         tokenizer_config = getattr(eeg_tokenizer, "config", None)
@@ -66,7 +89,7 @@ class HybridEEG2BOLDLatentModel(nn.Module):
         _freeze_eval(self.bold_vae)
 
     def train(self, mode: bool = True) -> "HybridEEG2BOLDLatentModel":
-        """父模型切换 train 时，BOLD-VAE 仍保持 frozen eval。"""
+        """Keep the frozen BOLD VAE in evaluation mode."""
         super().train(mode)
         self.bold_vae.eval()
         return self
@@ -76,7 +99,7 @@ class HybridEEG2BOLDLatentModel(nn.Module):
         expected = (512, 26, 16, 200)
         if not torch.is_tensor(eeg) or eeg.ndim != 5 or tuple(eeg.shape[1:]) != expected:
             raise ValueError(
-                "EEG 输入必须是 [B,512,26,16,200]，实际为 {}".format(
+                "Expected EEG shape [B, 512, 26, 16, 200], got {}".format(
                     tuple(eeg.shape) if torch.is_tensor(eeg) else type(eeg)
                 )
             )
@@ -86,19 +109,19 @@ class HybridEEG2BOLDLatentModel(nn.Module):
         expected = (512, 64)
         if not torch.is_tensor(bold) or bold.ndim != 3 or tuple(bold.shape[1:]) != expected:
             raise ValueError(
-                "BOLD 输入必须是 [B,512,64]，实际为 {}".format(
+                "Expected BOLD shape [B, 512, 64], got {}".format(
                     tuple(bold.shape) if torch.is_tensor(bold) else type(bold)
                 )
             )
         if bold.shape[0] != batch_size:
-            raise ValueError("EEG 和 BOLD 的 batch size 必须一致")
+            raise ValueError("EEG and BOLD must have the same batch size")
 
     def forward(
         self,
         eeg: torch.Tensor,
         bold: Optional[torch.Tensor] = None,
     ) -> EEG2BOLDOutput:
-        """执行 V1 forward；loss 由 runner 在模型外计算。"""
+        """Predict BOLD and optionally encode its target latents."""
         self._check_eeg(eeg)
         if bold is not None:
             self._check_bold(bold, eeg.shape[0])
@@ -117,17 +140,17 @@ class HybridEEG2BOLDLatentModel(nn.Module):
         expected_z = (eeg.shape[0], 256, 16)
         expected_bold = (eeg.shape[0], 512, 64)
         if tuple(z_pred.shape) != expected_z:
-            raise RuntimeError("z_pred shape 必须是 {}，实际为 {}".format(expected_z, tuple(z_pred.shape)))
+            raise RuntimeError("Expected z_pred shape {}, got {}".format(expected_z, tuple(z_pred.shape)))
         if tuple(bold_pred.shape) != expected_bold:
             raise RuntimeError(
-                "bold_pred shape 必须是 {}，实际为 {}".format(
+                "Expected bold_pred shape {}, got {}".format(
                     expected_bold,
                     tuple(bold_pred.shape),
                 )
             )
         if z_target is not None and tuple(z_target.shape) != expected_z:
             raise RuntimeError(
-                "z_target shape 必须是 {}，实际为 {}".format(
+                "Expected z_target shape {}, got {}".format(
                     expected_z,
                     tuple(z_target.shape),
                 )
@@ -151,6 +174,7 @@ class HybridEEG2BOLDLatentModel(nn.Module):
 __all__ = [
     "EEG2BOLDOutput",
     "HybridEEG2BOLDLatentModel",
+    "HybridLatentProjectionHead",
     "HybridEEGTokenizer",
     "HybridTokenizerConfig",
     "load_frozen_bold_vae",

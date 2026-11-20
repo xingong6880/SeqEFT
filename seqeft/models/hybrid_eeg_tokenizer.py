@@ -1,12 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-only
-# 从论文研究实现移入；仅调整包内导入和公开说明，保留计算与参数名称。
-"""Hybrid V1-Base 的 raw-token EEG tokenizer。
-
-每个 EEG frame 保留 LaBraM/MSS 的 raw tokens，分别经过两层 Perceiver-style
-latent tokenizer，得到 8 个 temporal slots 和 8 个 spectral slots。raw branch
-始终按 ``frame_chunk_size`` 分块执行，避免一次性保存 ``B*512`` 个 raw token
-sequence 的中间激活。
-"""
+"""Compress each frame's LaBraM and spectral tokens into learned EEG slots."""
 
 from __future__ import annotations
 
@@ -29,7 +22,6 @@ from .spectral import MultiScaleSpectralEncoder
 
 @dataclass(frozen=True)
 class HybridTokenizerConfig:
-    """tokenizer 的固定 shape 与容量参数。"""
 
     hidden_dim: int = 256
     input_scale: float = 0.01
@@ -61,19 +53,19 @@ class HybridTokenizerConfig:
         ):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-                raise ValueError("{} 必须是正整数".format(name))
+                raise ValueError("{} must be a positive integer".format(name))
         if self.sequence_length != 512:
-            raise ValueError("Hybrid tokenizer 的 sequence_length 必须是 512")
+            raise ValueError("sequence_length must be 512")
         if self.hidden_dim % self.heads != 0:
-            raise ValueError("hidden_dim 必须能被 heads 整除")
+            raise ValueError("hidden_dim must be divisible by heads")
         if not 0.0 <= float(self.dropout) < 1.0:
-            raise ValueError("dropout 必须位于 [0,1)")
+            raise ValueError("dropout must be in [0, 1)")
         if self.input_scale <= 0.0:
-            raise ValueError("input_scale 必须是正数")
+            raise ValueError("input_scale must be positive")
 
 
 class _PerceiverTokenizerBlock(nn.Module):
-    """一个 latent<-raw cross-attention、latent self-attention、FFN block。"""
+    """Cross-attention to raw tokens, followed by slot self-attention and an FFN."""
 
     def __init__(self, hidden_dim: int, heads: int, dropout: float) -> None:
         super().__init__()
@@ -128,7 +120,7 @@ class _PerceiverTokenizerBlock(nn.Module):
 
 
 class HybridEEGTokenizer(nn.Module):
-    """``[B,512,26,16,200]`` -> ``[B,512,16,D]`` 的 V1 tokenizer。"""
+    """Map [B, 512, 26, 16, 200] EEG to [B, 512, slots, hidden_dim]."""
 
     def __init__(
         self,
@@ -141,14 +133,14 @@ class HybridEEGTokenizer(nn.Module):
     ) -> None:
         super().__init__()
         if config is not None and config_kwargs:
-            raise TypeError("传入 config 后不能再传 HybridTokenizer 配置关键字")
+            raise TypeError("Pass either config or tokenizer keyword settings")
         self.config = config or HybridTokenizerConfig(**config_kwargs)
         self.temporal = temporal if temporal is not None else LaBraMTemporalEncoder()
         self.spectral = spectral if spectral is not None else MultiScaleSpectralEncoder()
         if not hasattr(self.temporal, "forward_patch_tokens"):
-            raise TypeError("temporal 必须提供 forward_patch_tokens()")
+            raise TypeError("temporal must provide forward_patch_tokens()")
         if not hasattr(self.spectral, "forward_tokens"):
-            raise TypeError("spectral 必须提供 forward_tokens()")
+            raise TypeError("spectral must provide forward_tokens()")
 
         width = self.config.hidden_dim
         feature_dim = self.config.samples_per_patch
@@ -214,9 +206,9 @@ class HybridEEGTokenizer(nn.Module):
         spectral_seed: int = 2026,
         **config_kwargs,
     ) -> "HybridEEGTokenizer":
-        """加载 LaBraM checkpoint，并构造随机初始化的 MSS branch。"""
+        """Load the LaBraM encoder and seed the spectral encoder separately."""
         if config is not None and config_kwargs:
-            raise TypeError("传入 config 后不能再传 HybridTokenizer 配置关键字")
+            raise TypeError("Pass either config or tokenizer keyword settings")
         tokenizer_config = config or HybridTokenizerConfig(**config_kwargs)
         temporal = LaBraMTemporalEncoder()
         report = load_temporal_checkpoint(temporal, Path(checkpoint_path))
@@ -233,7 +225,7 @@ class HybridEEGTokenizer(nn.Module):
         return tokenizer
 
     def train(self, mode: bool = True) -> "HybridEEGTokenizer":
-        """显式冻结 temporal branch 时，父模型 train 不改变其 eval 状态。"""
+        """Keep the temporal encoder in evaluation mode when frozen."""
         super().train(mode)
         if self.freeze_temporal:
             self.temporal.eval()
@@ -244,7 +236,7 @@ class HybridEEGTokenizer(nn.Module):
         expected = (512, 26, 16, 200)
         if not torch.is_tensor(eeg) or eeg.ndim != 5 or tuple(eeg.shape[1:]) != expected:
             raise ValueError(
-                "EEG 输入必须是 [B,512,26,16,200]，实际为 {}".format(
+                "Expected EEG shape [B, 512, 26, 16, 200], got {}".format(
                     tuple(eeg.shape) if torch.is_tensor(eeg) else type(eeg)
                 )
             )
@@ -256,7 +248,7 @@ class HybridEEGTokenizer(nn.Module):
         expected = (frames.shape[0], self.config.temporal_token_count, 200)
         if not torch.is_tensor(tokens) or tuple(tokens.shape) != expected:
             raise RuntimeError(
-                "LaBraM raw tokens 必须是 {}，实际为 {}".format(
+                "Expected LaBraM token shape {}, got {}".format(
                     expected,
                     tuple(tokens.shape) if torch.is_tensor(tokens) else type(tokens),
                 )
@@ -270,7 +262,7 @@ class HybridEEGTokenizer(nn.Module):
         expected = (frames.shape[0], self.config.spectral_token_count, 200)
         if not torch.is_tensor(tokens) or tuple(tokens.shape) != expected:
             raise RuntimeError(
-                "MSS raw tokens 必须是 {}，实际为 {}".format(
+                "Expected spectral token shape {}, got {}".format(
                     expected,
                     tuple(tokens.shape) if torch.is_tensor(tokens) else type(tokens),
                 )
@@ -310,7 +302,6 @@ class HybridEEGTokenizer(nn.Module):
         return self.frame_fusion(value)
 
     def _forward_chunk(self, chunk: torch.Tensor) -> torch.Tensor:
-        """执行一个 frame chunk；由 checkpoint 包裹以避免保留全序列激活。"""
         temporal_tokens = self._run_temporal(chunk)
         spectral_tokens = self._run_spectral(chunk)
         temporal_slots = self._tokenize_branch(
@@ -330,7 +321,6 @@ class HybridEEGTokenizer(nn.Module):
         return self._fuse_frame_slots(temporal_slots, spectral_slots)
 
     def forward(self, eeg: torch.Tensor) -> torch.Tensor:
-        """返回 ``[B,512,16,256]``（测试时 width 可缩小）。"""
         self._validate_eeg(eeg)
         batch, frames = eeg.shape[:2]
         flattened = (eeg * self.config.input_scale).reshape(
@@ -343,8 +333,7 @@ class HybridEEGTokenizer(nn.Module):
         chunk_size = self.config.frame_chunk_size
         for start in range(0, flattened.shape[0], chunk_size):
             chunk = flattened[start : start + chunk_size]
-            # 每个 chunk 的内部 attention 激活只在 backward 重算，不随 512 帧
-            # 全部保留；eval 或 no_grad 路径不需要 checkpoint 的额外开销。
+            # Recompute chunk activations during backward to bound GPU memory.
             if self.training and torch.is_grad_enabled():
                 outputs.append(checkpoint(self._forward_chunk, chunk, use_reentrant=False))
             else:
@@ -359,7 +348,7 @@ class HybridEEGTokenizer(nn.Module):
         return value + self.frame_position[:, :frames].unsqueeze(2)
 
     def provenance(self) -> dict:
-        """返回 tokenizer 的输入 scale、chunk 和 checkpoint provenance。"""
+        """Report tokenizer settings and the LaBraM checkpoint hash."""
         return {
             "input_scale": self.config.input_scale,
             "frame_chunk_size": self.config.frame_chunk_size,

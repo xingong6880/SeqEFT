@@ -1,4 +1,4 @@
-"""在真实参考尺寸下验证科学计算合同，不依赖私有数据或权重。"""
+"""Check reference model shapes and gradients with synthetic inputs."""
 
 import pytest
 import torch

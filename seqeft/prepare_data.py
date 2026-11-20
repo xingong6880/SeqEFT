@@ -1,11 +1,4 @@
-"""把上游 resting-state EEG .set 与 DiFuMo-64 .pkl 转换为 SeqEFT 缓存。
-
-运行前安装 pip install -e '.[data]'。在仓库根目录执行：
-python -m seqeft.prepare_data --eeg-dir EEG_set --bold-dir fMRI_difumo64 \
-    --output-dir data/cache/resting_state
-
-仅处理 configs/splits/resting_state.yaml 中的 29 条扫描；不下载数据。
-"""
+"""Convert EEGLAB recordings and DiFuMo-64 ROI tables to SeqEFT caches."""
 
 from __future__ import annotations
 
@@ -34,11 +27,7 @@ SPLIT_FILE = Path("configs/splits/resting_state.yaml")
 
 
 def _epoch_eeg(raw):
-    """复用原始预处理顺序，返回微伏 EEG 与有效 R149 事件的原始索引。
-
-    MNE 在包含两个端点的 3201 点 epoch 上做全窗 baseline，再保留前
-    3200 点。此处不除以 100；模型 tokenizer 内部负责 input_scale=0.01。
-    """
+    """Return EEG in microvolts and the original indices of retained R149 triggers."""
     import mne
 
     if raw.info["sfreq"] != 200:
@@ -51,9 +40,9 @@ def _epoch_eeg(raw):
     raw.pick_channels(list(VU_CHANNELS), ordered=True)
     events, event_id = mne.events_from_annotations(raw)
     if "R149" not in event_id:
-        raise ValueError("EEG 缺少 fMRI 同步事件 R149")
+        raise ValueError("EEG is missing the R149 fMRI trigger")
     events = mne.pick_events(events, include=event_id["R149"])
-    # 原始文件重采样时已经 preload；显式 load 同时兼容原本就是 200 Hz 的文件。
+    # Load recordings that were already at 200 Hz before filtering.
     raw.load_data()
     raw.filter(l_freq=0.5, h_freq=None)
     epochs = mne.Epochs(
@@ -61,29 +50,26 @@ def _epoch_eeg(raw):
         tmin=-16.0, tmax=0.0, baseline=(None, None),
         reject=None, preload=True,
     )
+    # Baseline correction uses all 3,201 samples before cropping off the endpoint.
     eeg = epochs.get_data(units="uV")[:, :, :3200]
     eeg = eeg.reshape(eeg.shape[0], 26, 16, 200).astype(np.float32, copy=False)
     return eeg, epochs.selection.astype(np.int64)
 
 
 def _validate_bold_schema(frame):
-    """保持文件中的 64 ROI 顺序，排除末尾两列 global signal。"""
     columns = tuple(frame.columns)
     if len(columns) != 66 or columns[-2:] != _GLOBAL_SIGNAL_COLUMNS:
-        raise ValueError("BOLD 必须为 64 ROI + global signal clean/raw，共 66 列")
+        raise ValueError("BOLD must contain 66 columns: 64 ROIs followed by the two global signals")
     roi_columns = columns[:64]
     if any(not isinstance(name, str) or not name.strip() for name in roi_columns):
-        raise ValueError("ROI 列名必须是非空字符串")
+        raise ValueError("ROI column names must be nonempty strings")
     if len(set(roi_columns)) != 64:
-        raise ValueError("64 个 ROI 列名必须唯一")
+        raise ValueError("ROI column names must be unique")
     return roi_columns
 
 
 def normalize_bold(bold):
-    """逐 ROI 在完整 scan 上去均值并按绝对值 95% 分位数归一化。
-
-    输入与输出均为 [64,T]；在选取 EEG 对应帧之前调用。
-    """
+    """Demean [ROI, time] data and scale by the 95th percentile absolute deviation."""
     means = np.mean(bold, axis=1, keepdims=True)
     centered = bold - means
     scale = np.quantile(np.abs(centered), q=0.95, axis=1, keepdims=True) + 1e-8
@@ -91,16 +77,16 @@ def normalize_bold(bold):
 
 
 def preprocess_bold(frame, selection):
-    """执行原始 5 阶 0.15 Hz 低通、全 scan 归一化与事件索引对齐。"""
+    """Filter and normalize the full BOLD scan, then align it to EEG triggers."""
     from scipy.signal import butter, filtfilt
 
     columns = _validate_bold_schema(frame)
     bold = frame.loc[:, columns].to_numpy().T
     selection = np.asarray(selection)
     if selection.ndim != 1 or not np.issubdtype(selection.dtype, np.integer):
-        raise ValueError("BOLD selection 必须是一维整数数组")
+        raise ValueError("BOLD selection must be a one-dimensional integer array")
     if len(selection) and (selection.min() < 0 or selection.max() >= bold.shape[1]):
-        raise ValueError("EEG 事件索引超出 BOLD 帧范围")
+        raise ValueError("EEG trigger indices are outside the BOLD frame range")
     fs = 1.0 / 2.1
     b, a = butter(N=5, Wn=0.15 / (0.5 * fs), btype="low", analog=False)
     filtered = filtfilt(b, a, bold, axis=1)
@@ -109,14 +95,14 @@ def preprocess_bold(frame, selection):
 
 
 def _write_scan(output_dir, scan_id, split, eeg, bold, frame_index, columns):
-    """在临时目录写完整四个文件，再发布 scan 目录；不覆盖已有缓存。"""
+    """Write all four cache files before publishing the scan directory."""
     target = output_dir / scan_id
     if target.exists():
         raise FileExistsError(target)
     if eeg.shape != (len(frame_index), 26, 16, 200) or bold.shape != (len(frame_index), 64):
-        raise ValueError("EEG/BOLD/frame_index 形状或长度不一致")
+        raise ValueError("EEG, BOLD, and frame indices have incompatible shapes")
     if not len(frame_index) or not np.isfinite(eeg).all() or not np.isfinite(bold).all():
-        raise ValueError("预处理结果必须非空且全部为有限值")
+        raise ValueError("Preprocessed arrays must be nonempty and finite")
     metadata = {
         "cache_version": 2, "scan_id": scan_id,
         "subject_id": scan_id.split("-", 1)[0], "split": split,
@@ -151,19 +137,18 @@ def _write_scan(output_dir, scan_id, split, eeg, bold, frame_index, columns):
 
 
 def prepare_data(eeg_dir, bold_dir, output_dir):
-    """只读取固定名单中的源文件；全部路径先检查，再逐条生成缓存。"""
     import mne
     import pandas as pd
 
     eeg_dir, bold_dir, output_dir = (Path(p).expanduser().resolve()
                                      for p in (eeg_dir, bold_dir, output_dir))
     if not eeg_dir.is_dir() or not bold_dir.is_dir():
-        raise FileNotFoundError("EEG 或 BOLD 输入目录不存在")
+        raise FileNotFoundError("EEG or BOLD input directory does not exist")
     if output_dir.is_relative_to(eeg_dir) or output_dir.is_relative_to(bold_dir):
-        raise ValueError("输出目录必须位于两个源数据目录之外")
+        raise ValueError("The output directory must be outside both source directories")
     manifest = load_split_manifest(SPLIT_FILE)
     if set(manifest) != {"train", "test"} or len(manifest["train"]) != 24 or len(manifest["test"]) != 5:
-        raise ValueError("需要仓库提供的固定 24/5 resting-state 划分")
+        raise ValueError("The fixed resting-state split must contain 24 training and 5 evaluation scans")
     sources = []
     for split in ("train", "test"):
         for scan_id in manifest[split]:
@@ -184,7 +169,7 @@ def prepare_data(eeg_dir, bold_dir, output_dir):
         if roi_order is None:
             roi_order = columns
         if columns != roi_order:
-            raise ValueError("跨 scan 的 ROI 顺序不一致: " + scan_id)
+            raise ValueError("ROI column order differs across scans: " + scan_id)
         _write_scan(output_dir, scan_id, split, eeg, bold, selection, columns)
         print(f"{scan_id}: {len(selection)} aligned frames", flush=True)
         del raw, eeg, bold
@@ -193,9 +178,9 @@ def prepare_data(eeg_dir, bold_dir, output_dir):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--eeg-dir", required=True, help="上游 EEG_set 目录，包含 .set 和伴生 .fdt")
-    parser.add_argument("--bold-dir", required=True, help="上游 fMRI_difumo64 目录")
-    parser.add_argument("--output-dir", required=True, help="新缓存目录，不覆盖已有 scan")
+    parser.add_argument("--eeg-dir", required=True, help="Directory containing EEGLAB .set and .fdt files")
+    parser.add_argument("--bold-dir", required=True, help="Directory containing DiFuMo-64 ROI tables")
+    parser.add_argument("--output-dir", required=True, help="Directory for the generated scan caches")
     args = parser.parse_args()
     print(json.dumps(prepare_data(args.eeg_dir, args.bold_dir, args.output_dir), indent=2))
 

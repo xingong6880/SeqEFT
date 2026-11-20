@@ -6,10 +6,10 @@ build-backend = "setuptools.build_meta"
 name = "seqeft"
 version = "0.1.0"
 description = "Latent Sequence Alignment for EEG-to-fMRI Translation"
-readme = "README.en.md"
+readme = "README.md"
 requires-python = ">=3.9,<3.12"
 license = "GPL-3.0-only"
-license-files = ["LICENSE", "LICENSES/*.txt", "THIRD_PARTY_NOTICES.md"]
+license-files = ["LICENSE", "LICENSES/*.txt"]
 authors = [{name = "SeqEFT contributors"}]
 dependencies = [
     "torch==2.0.0",
@@ -32,7 +32,7 @@ Homepage = "https://xingong6880.github.io/projects/seqeft/"
 Repository = "https://github.com/xingong6880/SeqEFT"
 
 [tool.setuptools.packages.find]
-where = ["src"]
+include = ["seqeft", "seqeft.*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

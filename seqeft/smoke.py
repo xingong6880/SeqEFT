@@ -1,9 +1,4 @@
-"""在随机合成输入上检查真实模型的形状与梯度，不测量预测精度。
-
-运行：python -m seqeft.smoke
-不需要数据集或 checkpoint；完整 512 帧 EEG 编码较慢，因此只单独编码一帧，
-随后在完整长度的随机 tokens 上检查 latent alignment 和冻结 decoder。
-"""
+"""Check model shapes and gradients with synthetic inputs."""
 
 from __future__ import annotations
 
@@ -23,7 +18,7 @@ def _finite_nonzero(value: torch.Tensor | None) -> bool:
 
 
 def check_vae() -> dict:
-    """Stage 1：在真实 512×64 输入上反传，检查 encoder 和 decoder。"""
+    """Backpropagate through the VAE on a full-length synthetic window."""
     vae = BOLDVAE(BOLDVAEConfig(
         input_length=512, latent_length=256, temporal_compression=2,
     )).train()
@@ -40,7 +35,7 @@ def check_vae() -> dict:
 
 
 def check_parameter_counts(model) -> dict:
-    """参数量必须与论文对应的 Content Query + Local-only 实验一致。"""
+    """Check the reference model's parameter counts and initialization."""
     total = sum(p.numel() for p in model.parameters())
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     assert (total, trainable) == (18_147_696, 16_852_240), (total, trainable)
@@ -50,7 +45,7 @@ def check_parameter_counts(model) -> dict:
 
 
 def check_eeg_branches(model) -> dict:
-    """一帧真实 LaBraM/MSS forward；使用随机权重和随机 EEG。"""
+    """Run both EEG encoders and slot fusion on one synthetic frame."""
     model.eval()
     frame = torch.randn(1, 26, 16, 200)
     with torch.inference_mode():
@@ -66,7 +61,7 @@ def check_eeg_branches(model) -> dict:
 
 
 def check_alignment(model) -> dict:
-    """检查完整长度对齐链路，以及 FC loss 穿过冻结 decoder 的梯度。"""
+    """Check full-length alignment and gradients through the frozen decoder."""
     model.zero_grad(set_to_none=True)
     model.train()
     assert not model.bold_vae.training
@@ -85,7 +80,7 @@ def check_alignment(model) -> dict:
     assert not latent_target.requires_grad
     fc_loss = functional_connectivity_mse_loss(prediction, target)
     fc_gradient = torch.autograd.grad(fc_loss, latent, retain_graph=True)[0]
-    assert _finite_nonzero(fc_gradient), "FC loss 必须穿过冻结 decoder 传到 latent"
+    assert _finite_nonzero(fc_gradient), "The FC loss must propagate through the frozen decoder to the latent."
     loss = F.mse_loss(latent, latent_target) + 0.1 * fc_loss
     assert torch.isfinite(loss)
     loss.backward()
@@ -103,7 +98,6 @@ def check_alignment(model) -> dict:
 
 
 def run_smoke(*, include_eeg: bool = True) -> dict:
-    """执行 CPU 合成检查；真实数据与预训练性能仍需独立评价。"""
     previous_threads = torch.get_num_threads()
     torch.set_num_threads(1)
     started = time.perf_counter()
@@ -126,7 +120,7 @@ def run_smoke(*, include_eeg: bool = True) -> dict:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--skip-eeg", action="store_true",
-                        help="跳过单帧 LaBraM/MSS 检查，只验证 VAE 与 latent alignment")
+                        help="Skip the single-frame EEG encoder check")
     args = parser.parse_args()
     print(json.dumps(run_smoke(include_eeg=not args.skip_eeg), indent=2))
 

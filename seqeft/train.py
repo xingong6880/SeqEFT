@@ -1,4 +1,4 @@
-"""Stage 2：训练 EEG 到 fMRI latent 的映射，冻结 VAE 并维护 EMA。"""
+"""Stage 2. Train EEG-to-fMRI latent alignment with a frozen VAE."""
 from __future__ import annotations
 
 import argparse
@@ -17,7 +17,7 @@ from .utils import configure_runtime, load_config, restore_rng, rng_state, save_
 
 
 class TrainableEMA:
-    """论文 EMA：第一次更新后复制参数，此后以 0.99 平滑；VAE 和 buffers 不参与。"""
+    """Maintain an exponential moving average of trainable parameters."""
 
     def __init__(self, model, decay=0.99):
         self.model_ref = weakref.ref(model)
@@ -43,14 +43,14 @@ class TrainableEMA:
         parameters = dict(self.model_ref().named_parameters())
         expected = {k for k, p in parameters.items() if p.requires_grad}
         if state["decay"] != self.decay or set(state["shadow"]) != expected:
-            raise ValueError("EMA 参数集合或 decay 不匹配")
+            raise ValueError("EMA parameter names or decay do not match")
         self.num_updates = state["num_updates"]
         self.shadow = {k: v.to(parameters[k]).clone() for k, v in state["shadow"].items()}
 
     @contextmanager
     def applied(self):
         if not self.num_updates:
-            raise RuntimeError("EMA 尚未更新")
+            raise RuntimeError("EMA has received no updates")
         parameters = dict(self.model_ref().named_parameters())
         original = {k: parameters[k].detach().clone() for k in self.shadow}
         try:
@@ -65,7 +65,7 @@ class TrainableEMA:
 
 
 def build_optimizer(model, config):
-    """保持论文三组参数的顺序、学习率与 weight decay。"""
+    """Build the three optimizer groups in reference order."""
     training = config["training"]
     groups = [
         {"name": "pretrained_labram",
@@ -82,7 +82,7 @@ def build_optimizer(model, config):
     ]
     ids = [id(p) for group in groups for p in group["params"]]
     if len(ids) != len(set(ids)) or set(ids) != {id(p) for p in model.parameters() if p.requires_grad}:
-        raise ValueError("optimizer 必须恰好覆盖所有可训练参数")
+        raise ValueError("The optimizer must cover each trainable parameter exactly once")
     return torch.optim.AdamW(groups, weight_decay=training["weight_decay"])
 
 
@@ -99,7 +99,7 @@ def build_scheduler(optimizer, config):
 
 
 def alignment_loss(output, bold, config):
-    """decoder 参数被冻结，但保留对预测 latent 的梯度。"""
+    """Compute latent MSE and connectivity loss through the frozen decoder."""
     latent = (output.z_pred.float() - output.z_target.float()).square().mean()
     fc = functional_connectivity_mse_loss(output.bold_pred, bold)
     loss = config["loss"]["latent_mse_weight"] * latent + config["loss"]["fc_weight"] * fc
@@ -109,7 +109,7 @@ def alignment_loss(output, bold, config):
 def run(config, device="cuda", resume=None):
     seed, training = config["experiment"]["seed"], config["training"]
     if training.get("gradient_accumulation_steps", 1) != 1 or training.get("num_workers", 0) != 0:
-        raise ValueError("参考协议使用 accumulation=1、num_workers=0")
+        raise ValueError("The reference loop requires gradient_accumulation_steps=1 and num_workers=0")
     configure_runtime(seed)
     device = torch.device(device)
     caches = load_existing_paired_caches(config, split="train")
@@ -118,7 +118,7 @@ def run(config, device="cuda", resume=None):
     loader = DataLoader(dataset, batch_size=training["batch_size"], shuffle=True,
                         drop_last=False, num_workers=0, generator=generator,
                         collate_fn=paired_collate)
-    model = build_model(config, device)
+    model = build_model(config, device, load_pretrained=not resume)
     optimizer = build_optimizer(model, config)
     scheduler = build_scheduler(optimizer, config)
     ema = TrainableEMA(model, training.get("ema_decay", 0.99))
@@ -127,7 +127,7 @@ def run(config, device="cuda", resume=None):
     if resume:
         payload = torch.load(resume, map_location="cpu", weights_only=False)
         if payload["config"] != config:
-            raise ValueError("恢复训练时配置必须与 checkpoint 完全一致")
+            raise ValueError("The resume config must exactly match the checkpoint config")
         model.load_state_dict(payload["model"], strict=True)
         optimizer.load_state_dict(payload["optimizer"])
         scheduler.load_state_dict(payload["scheduler"])
@@ -147,7 +147,7 @@ def run(config, device="cuda", resume=None):
             eeg, bold = batch["eeg"].to(device), batch["bold"].to(device)
             loss, latent, fc = alignment_loss(model(eeg, bold), bold, config)
             if not torch.isfinite(loss):
-                raise ValueError("训练 loss 出现 NaN/Inf")
+                raise ValueError("The training loss is not finite")
             loss.backward()
             torch.nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad],
                                            training["grad_clip_norm"], error_if_nonfinite=True)
@@ -184,7 +184,7 @@ def main():
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--seed", type=int)
     parser.add_argument("--output-dir")
-    parser.add_argument("--resume", help="同一配置的 last.pt")
+    parser.add_argument("--resume", help="Path to last.pt from a run with the same config")
     args = parser.parse_args()
     config = load_config(args.config)
     if args.seed is not None:

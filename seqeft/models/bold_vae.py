@@ -1,17 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-only
-# 从论文研究实现移入；仅调整包内导入和公开说明，保留计算与参数名称。
-"""固定 512 帧 BOLD-VAE V0 及其首个 temporal control。
-
-这个模块故意与旧的 ``cfm.vae`` 隔离。V0 只接受固定形状
-``[B, 512, 64]``，通过可学习的 stride-2 temporal convolution 压缩时间轴，
-再由对称的 learned upsampling 恢复到原始分辨率。默认配置是设计文档中的
-V0-A（4x temporal compression）；显式设置 ``temporal_compression=2`` 可运行
-设计文档要求的 V0-B 对照（2x temporal compression）。
-
-所有输入信息都必须经过 ``[latent_length, 16]`` latent bottleneck；这里不提供 U-Net
-式的高分辨率 skip connection，避免 reconstruction ceiling 依赖后续 CFM
-无法生成的额外信息。
-"""
+"""Sequence VAE that compresses and reconstructs 512-frame BOLD windows."""
 
 import math
 from dataclasses import dataclass
@@ -21,18 +9,10 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from .utils import SinusoidalPositionalEncoding, reparameterize
-
 
 @dataclass(frozen=True)
 class BOLDVAEConfig:
-    """BOLD-VAE V0 的模型超参数。
-
-    ``input_length``、``latent_length``、``roi_count``、``latent_dim`` 和
-    ``temporal_compression`` 是实验合同。V0-A/V0-B 之间只显式改变
-    ``temporal_compression`` 与由它决定的 ``latent_length``，而不是让模型
-    自动适应任意长度。
-    """
+    """VAE architecture and loss settings for 2x or 4x temporal compression."""
 
     input_length: int = 512
     latent_length: int = 128
@@ -66,27 +46,27 @@ class BOLDVAEConfig:
         for name in positive_fields:
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-                raise ValueError("{} 必须是正整数".format(name))
+                raise ValueError("{} must be a positive integer".format(name))
         if self.input_length != 512:
-            raise ValueError("BOLD-VAE 的 input_length 必须是 512")
+            raise ValueError("input_length must be 512")
         if self.temporal_compression not in (2, 4):
-            raise ValueError("首个 temporal ablation 只支持 2x 或 4x compression")
+            raise ValueError("temporal_compression must be 2 or 4")
         if self.input_length % self.temporal_compression != 0:
-            raise ValueError("input_length 必须能被 temporal_compression 整除")
+            raise ValueError("input_length must be divisible by temporal_compression")
         if self.latent_length != self.input_length // self.temporal_compression:
             raise ValueError(
-                "latent_length 必须等于 input_length / temporal_compression"
+                "latent_length must equal input_length / temporal_compression"
             )
         if self.roi_count != 64:
-            raise ValueError("BOLD-VAE V0 的 roi_count 必须是 64")
+            raise ValueError("roi_count must be 64")
         if self.latent_dim != 16:
-            raise ValueError("BOLD-VAE V0 的 latent_dim 必须是 16")
+            raise ValueError("latent_dim must be 16")
         if self.hidden_width % self.attention_heads != 0:
-            raise ValueError("hidden_width 必须能被 attention_heads 整除")
+            raise ValueError("hidden_width must be divisible by attention_heads")
         if not 0.0 <= self.dropout < 1.0:
-            raise ValueError("dropout 必须在 [0, 1) 内")
+            raise ValueError("dropout must be in [0, 1)")
         if self.beta_kl < 0.0 or self.spectral_weight < 0.0:
-            raise ValueError("beta_kl 和 spectral_weight 不能为负数")
+            raise ValueError("beta_kl and spectral_weight must be nonnegative")
         for name in ("tcorr_weight", "fc_weight"):
             value = getattr(self, name)
             if (
@@ -95,11 +75,10 @@ class BOLDVAEConfig:
                 or not math.isfinite(float(value))
                 or value < 0.0
             ):
-                raise ValueError("{} 必须是有限非负数".format(name))
+                raise ValueError("{} must be finite and nonnegative".format(name))
 
 
 def _group_count(channels: int) -> int:
-    """选择能整除 channel 数的 GroupNorm group 数。"""
     groups = min(8, channels)
     while channels % groups != 0:
         groups -= 1
@@ -107,7 +86,7 @@ def _group_count(channels: int) -> int:
 
 
 class TemporalResBlock(nn.Module):
-    """保持时间长度不变的卷积 residual block。"""
+    """Convolutional residual block that preserves sequence length."""
 
     def __init__(self, channels: int, dropout: float) -> None:
         super().__init__()
@@ -127,11 +106,10 @@ class TemporalResBlock(nn.Module):
 
 
 class TemporalDownsample(nn.Module):
-    """learned 2x temporal downsampling，长度恰好减半。"""
+    """Learned downsampling by a factor of two."""
 
     def __init__(self, channels: int) -> None:
         super().__init__()
-        # kernel=4、stride=2、padding=1 对偶数输入给出严格的 L/2。
         self.projection = nn.Conv1d(
             channels, channels, kernel_size=4, stride=2, padding=1
         )
@@ -141,7 +119,7 @@ class TemporalDownsample(nn.Module):
 
 
 class TemporalUpsample(nn.Module):
-    """nearest-neighbor 2x 插值后接可学习 Conv1D refine。"""
+    """Upsample by two with nearest-neighbor interpolation and a 1D convolution."""
 
     def __init__(self, channels: int) -> None:
         super().__init__()
@@ -152,8 +130,30 @@ class TemporalUpsample(nn.Module):
         return self.refine(hidden)
 
 
+class SinusoidalPositionalEncoding(nn.Module):
+    """Compute sinusoidal position encodings for the input length."""
+
+    def __init__(self, width: int, max_len: int = 4096) -> None:
+        super().__init__()
+        # Retain max_len for compatibility with existing callers.
+        self.width = width
+        self.max_len = max_len
+
+    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+        length = tokens.shape[1]
+        positions = torch.arange(length, device=tokens.device).unsqueeze(1).float()
+        divisor = torch.exp(
+            torch.arange(0, self.width, 2, device=tokens.device).float()
+            * (-math.log(10000.0) / self.width)
+        )
+        table = torch.zeros(length, self.width, device=tokens.device)
+        table[:, 0::2] = torch.sin(positions * divisor)
+        table[:, 1::2] = torch.cos(positions * divisor)
+        return tokens + table.unsqueeze(0)
+
+
 class BottleneckTemporalTransformer(nn.Module):
-    """只在 compressed-token bottleneck 上做全局 temporal modeling。"""
+    """Apply temporal self-attention at the compressed sequence length."""
 
     def __init__(self, config: BOLDVAEConfig) -> None:
         super().__init__()
@@ -181,7 +181,7 @@ class BottleneckTemporalTransformer(nn.Module):
 
 
 class BOLDVAEEncoder(nn.Module):
-    """将 ``[B,512,64]`` 编码成 ``mu/logvar: [B,L_latent,16]``。"""
+    """Encode [B, 512, 64] as a posterior mean and log variance of shape [B, L, 16]."""
 
     def __init__(self, config: BOLDVAEConfig) -> None:
         super().__init__()
@@ -218,7 +218,7 @@ class BOLDVAEEncoder(nn.Module):
         self.logvar_head = nn.Linear(width, config.latent_dim)
 
     def forward(self, bold: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        hidden = bold.transpose(1, 2)  # [B, 64, 512]，Conv1D 使用 C-first。
+        hidden = bold.transpose(1, 2)
         hidden = self.input_blocks(self.input_projection(hidden))
         hidden = self.middle_blocks(self.downsample1(hidden))
         hidden = self.downsample2(hidden)
@@ -229,7 +229,7 @@ class BOLDVAEEncoder(nn.Module):
 
 
 class BOLDVAEDecoder(nn.Module):
-    """将 ``[B,L_latent,16]`` 解码成 ``[B,512,64]``。"""
+    """Decode [B, L, 16] latents to [B, 512, 64] BOLD."""
 
     def __init__(self, config: BOLDVAEConfig) -> None:
         super().__init__()
@@ -275,13 +275,9 @@ class BOLDVAEDecoder(nn.Module):
 def spectral_log_magnitude_loss(
     reconstruction: torch.Tensor, target: torch.Tensor
 ) -> torch.Tensor:
-    """沿时间轴、逐 ROI 比较 log-rFFT magnitude。
-
-    输入顺序是 ``[B,T,ROI]``，所以 FFT 明确使用 ``dim=1``；ROI 维度绝不
-    参与 FFT。固定长度 V0 不需要 padding mask。
-    """
+    """Compare log FFT magnitudes along the time axis for each ROI."""
     if reconstruction.shape != target.shape or reconstruction.ndim != 3:
-        raise ValueError("reconstruction 和 target 必须同为 [B,T,ROI]")
+        raise ValueError("Reconstruction and target must share shape [B, T, ROI]")
     reconstruction_spectrum = torch.log1p(
         torch.fft.rfft(reconstruction, dim=1).abs()
     )
@@ -295,15 +291,11 @@ def temporal_correlation_loss(
     *,
     eps: float = 1e-6,
 ) -> torch.Tensor:
-    """沿时间轴逐 ROI 计算 ``1 - Pearson``，再对 batch/ROI 求平均。
-
-    结构损失固定在 FP32 中计算；对零方差轨迹使用 ``eps`` 稳定分母，保证
-    常数窗口仍能产生有限 loss 和有限梯度。
-    """
+    """Average one minus temporal Pearson correlation across batches and ROIs."""
     if prediction.shape != target.shape or prediction.ndim != 3:
-        raise ValueError("prediction/target 必须同为 [B,T,ROI]")
+        raise ValueError("Prediction and target must share shape [B, T, ROI]")
     if prediction.shape[1] < 2:
-        raise ValueError("TCorr loss 至少需要两个时间点")
+        raise ValueError("Temporal correlation requires at least two frames")
     prediction = prediction.float()
     target = target.float()
     prediction = prediction - prediction.mean(dim=1, keepdim=True)
@@ -323,17 +315,13 @@ def functional_connectivity_mse_loss(
     *,
     eps: float = 1e-6,
 ) -> torch.Tensor:
-    """比较每个窗口 ROI Pearson FC 矩阵 strict upper triangle 的 MSE。
-
-    FC edge 的 Pearson loss 刻意不参与首个 pilot；这里仅保留 correlation
-    matrix 的 MSE，并在 FP32 中对常数 ROI 使用稳定分母。
-    """
+    """Compute MSE between the strict upper triangles of ROI correlation matrices."""
     if prediction.shape != target.shape or prediction.ndim != 3:
-        raise ValueError("prediction/target 必须同为 [B,T,ROI]")
+        raise ValueError("Prediction and target must share shape [B, T, ROI]")
     if prediction.shape[1] < 2:
-        raise ValueError("FC loss 至少需要两个时间点")
+        raise ValueError("FC loss requires at least two frames")
     if prediction.shape[2] < 2:
-        raise ValueError("FC loss 至少需要两个 ROI")
+        raise ValueError("FC loss requires at least two ROIs")
     prediction = prediction.float()
     target = target.float()
 
@@ -357,17 +345,26 @@ def functional_connectivity_mse_loss(
     )
 
 
+def reparameterize(mean, logvar, sample=True):
+    """Sample a diagonal Gaussian by reparameterization or return its mean."""
+    if not sample:
+        return mean
+    std = torch.exp(0.5 * logvar)
+    epsilon = torch.randn_like(std)
+    return mean + epsilon * std
+
+
 def gaussian_kl_loss(mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
-    """标准 diagonal Gaussian 到 N(0,I) 的 KL，平均 batch/time/dim。"""
+    """Compute mean KL divergence from the diagonal posterior to a standard normal."""
     if mu.shape != logvar.shape or mu.ndim != 3:
-        raise ValueError("mu 和 logvar 必须同为 [B,T,D]")
+        raise ValueError("mu and logvar must share shape [B, T, D]")
     elementwise = -0.5 * (1.0 + logvar - mu.pow(2) - logvar.exp())
     return elementwise.mean()
 
 
 @dataclass
 class BOLDVAEOutput:
-    """V0 forward 的完整结果与分项 loss。"""
+    """Reconstruction, latents, and loss terms."""
 
     reconstruction: torch.Tensor
     z: torch.Tensor
@@ -382,35 +379,26 @@ class BOLDVAEOutput:
 
     @property
     def mean(self) -> torch.Tensor:
-        """兼容旧代码的命名；新的 API 使用 ``mu``。"""
+        """Alias for mu."""
         return self.mu
 
     @property
     def loss(self) -> torch.Tensor:
-        """兼容旧训练脚本的命名；新的 API 使用 ``total_loss``。"""
+        """Alias for total_loss."""
         return self.total_loss
 
 
 class BOLDVAE(nn.Module):
-    """固定形状 BOLD-VAE V0-A/V0-B。
-
-    Public contract:
-
-    ``[B,512,64] -> [B,L_latent,16] -> [B,512,64]``，其中 ``L_latent``
-    由 ``temporal_compression`` 显式决定。
-
-    ``encode(..., sample=False)`` 返回 posterior mean；训练时 ``forward``
-    根据 ``self.training`` 进行 reparameterization，eval 时自动使用 mean。
-    """
+    """Reconstruct BOLD through a temporal bottleneck with 16 features per step."""
 
     def __init__(self, config: Optional[BOLDVAEConfig] = None, **kwargs) -> None:
         super().__init__()
         if config is None:
             config = BOLDVAEConfig(**kwargs)
         elif kwargs:
-            raise TypeError("传入 config 后不能再传模型关键字参数")
+            raise TypeError("Pass either config or keyword settings")
         if not isinstance(config, BOLDVAEConfig):
-            raise TypeError("config 必须是 BOLDVAEConfig")
+            raise TypeError("config must be a BOLDVAEConfig")
         self.config = config
         self.encoder = BOLDVAEEncoder(config)
         self.decoder = BOLDVAEDecoder(config)
@@ -419,11 +407,11 @@ class BOLDVAE(nn.Module):
         expected = (self.config.input_length, self.config.roi_count)
         if not torch.is_tensor(bold) or bold.ndim != 3:
             raise ValueError(
-                "BOLD 输入必须是 [B,{},{}] tensor".format(*expected)
+                "BOLD must be a tensor with shape [B, {}, {}]".format(*expected)
             )
         if tuple(bold.shape[1:]) != expected:
             raise ValueError(
-                "BOLD 输入必须是 [B,{},{}]，实际为 {}".format(
+                "Expected BOLD shape [B, {}, {}], got {}".format(
                     *expected, tuple(bold.shape)
                 )
             )
@@ -432,11 +420,11 @@ class BOLDVAE(nn.Module):
         expected = (self.config.latent_length, self.config.latent_dim)
         if not torch.is_tensor(latent) or latent.ndim != 3:
             raise ValueError(
-                "latent 输入必须是 [B,{},{}] tensor".format(*expected)
+                "Latent input must be a tensor with shape [B, {}, {}]".format(*expected)
             )
         if tuple(latent.shape[1:]) != expected:
             raise ValueError(
-                "latent 输入必须是 [B,{},{}]，实际为 {}".format(
+                "Expected latent shape [B, {}, {}], got {}".format(
                     *expected, tuple(latent.shape)
                 )
             )
@@ -444,22 +432,21 @@ class BOLDVAE(nn.Module):
     def encode_distribution(
         self, bold: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """返回 posterior ``mu`` 与 ``logvar``，形状均为 ``[B,L_latent,16]``。"""
+        """Return posterior mean and log variance."""
         self._check_bold(bold)
         return self.encoder(bold)
 
     def encode(self, bold: torch.Tensor, sample: bool = False) -> torch.Tensor:
-        """编码 BOLD；默认返回 deterministic posterior mean。"""
+        """Encode BOLD, using the posterior mean by default."""
         mu, logvar = self.encode_distribution(bold)
         return reparameterize(mu, logvar, sample=sample)
 
     def decode(self, latent: torch.Tensor) -> torch.Tensor:
-        """解码 latent，输出严格为 ``[B,512,64]``。"""
         self._check_latent(latent)
         return self.decoder(latent)
 
     def forward(self, bold: torch.Tensor) -> BOLDVAEOutput:
-        """执行 VAE forward，并返回基础与结构 loss 分项。"""
+        """Sample the posterior during training and use its mean during evaluation."""
         self._check_bold(bold)
         mu, logvar = self.encoder(bold)
         z = reparameterize(mu, logvar, sample=self.training)
@@ -475,7 +462,7 @@ class BOLDVAE(nn.Module):
             + self.config.spectral_weight * spectral_loss
         )
         if self.config.tcorr_weight == 0.0 and self.config.fc_weight == 0.0:
-            # 默认 V0 objective 保持与旧路径逐 bit 相同。
+            # Keep the reference loss arithmetic when the optional terms are disabled.
             total_loss = legacy_total_loss
         else:
             total_loss = (
@@ -498,7 +485,7 @@ class BOLDVAE(nn.Module):
 
 
 def count_parameters(model: nn.Module, trainable_only: bool = False) -> int:
-    """统计模型参数量，供 checkpoint/实验 handoff 使用。"""
+    """Count all parameters or just the trainable ones."""
     parameters = model.parameters()
     if trainable_only:
         parameters = (p for p in parameters if p.requires_grad)

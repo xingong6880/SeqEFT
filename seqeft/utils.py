@@ -1,4 +1,4 @@
-"""配置、随机状态与 checkpoint 的小型公共工具。"""
+"""Configuration, checkpoint, and RNG utilities."""
 from __future__ import annotations
 
 import json
@@ -11,15 +11,15 @@ import yaml
 
 
 def load_config(path):
-    """路径相对于运行命令的目录；README 命令均在仓库根目录执行。"""
+    """Load a YAML config with paths relative to the working directory."""
     config = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
     if not isinstance(config, dict):
-        raise ValueError("配置文件必须是 YAML 字典")
+        raise ValueError("The config must be a YAML mapping")
     return config
 
 
 def configure_runtime(seed):
-    """与论文运行一致：FP32、单 CPU 线程及 high matmul precision。"""
+    """Set the reference precision, thread count, and random seeds."""
     torch.set_num_threads(1)
     torch.set_float32_matmul_precision("high")
     torch.backends.cudnn.allow_tf32 = True
@@ -36,7 +36,7 @@ def write_json(path, value):
 
 
 def save_checkpoint(path, payload):
-    """先写临时文件再替换，避免中断产生半个 checkpoint。"""
+    """Replace the checkpoint atomically after writing the complete file."""
     path = Path(path)
     temporary = path.with_suffix(".tmp")
     torch.save(payload, temporary)
@@ -59,19 +59,19 @@ def restore_rng(state, generator):
 
 
 def load_inference_model(checkpoint, device):
-    """完整 SeqEFT checkpoint 内含 VAE；推理无需另取 LaBraM/VAE 文件。"""
+    """Load a complete SeqEFT model with EMA weights, including the frozen VAE."""
     from .model import build_model
 
     payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
     configure_runtime(payload["config"].get("experiment", {}).get("seed", 20261012))
     model = build_model(payload["config"], device=device, load_pretrained=False)
     weights = dict(payload["model"])
-    # last.pt 保存训练参数及 EMA；推理始终使用 EMA shadow 覆盖可训练参数。
+    # Overlay the EMA weights on a training checkpoint.
     if "ema" in payload:
         if payload["ema"]["num_updates"] <= 0:
-            raise ValueError("checkpoint 中的 EMA 尚未更新")
+            raise ValueError("The checkpoint EMA has received no updates")
         weights.update(payload["ema"]["shadow"])
     elif payload.get("checkpoint_kind") != "ema_inference_only":
-        raise ValueError("请提供 ema_last.pt 或包含 EMA 状态的训练 checkpoint")
+        raise ValueError("Provide ema_last.pt or a training checkpoint that contains EMA state")
     model.load_state_dict(weights, strict=True)
     return model.eval(), payload["config"]

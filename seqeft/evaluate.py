@@ -1,4 +1,4 @@
-"""按扫描计算 Center512 六项指标；多个 checkpoint 汇总 seed 均值与样本 SD。"""
+"""Evaluate the center 512 frames per scan and summarize results across checkpoints."""
 from __future__ import annotations
 
 import argparse
