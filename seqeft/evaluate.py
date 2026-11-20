@@ -10,7 +10,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from .data import CenterPairedWindowDataset, load_existing_paired_caches, paired_collate
-from .metrics import scan_metrics
+from .metrics import METRIC_KEYS, scan_metrics
 from .utils import load_config, load_inference_model, write_json
 
 
@@ -25,9 +25,8 @@ def evaluate(checkpoint, config, device="cuda", split="test"):
         target = batch["bold"][0].numpy().astype(np.float64)
         scores = scan_metrics(prediction, target)
         rows.append({"scan_id": batch["scan_id"][0], "subject_id": batch["subject_id"][0], **scores})
-    keys = ("tcorr", "bold_mse", "pixcorr", "conn_mse", "f1_025", "f1_05")
     return {"checkpoint": str(checkpoint), "split": split, "scans": rows,
-            "mean": {k: float(np.mean([r[k] for r in rows])) for k in keys}}
+            "mean": {k: float(np.mean([r[k] for r in rows])) for k in METRIC_KEYS}}
 
 
 def main():

@@ -132,8 +132,9 @@ class _WindowDataset(Dataset):
                 if hasattr(cache, name):
                     arrays[name] = np.asarray(getattr(cache, name))
                 else:
-                    filename = "frame_index.npy" if name == "frame_index" else name + ".npy"
-                    path = getattr(cache, name + "_path", Path(cache.root) / filename)
+                    path = getattr(cache, name + "_path", None)
+                    if path is None:
+                        path = Path(cache.root) / f"{name}.npy"
                     arrays[name] = np.load(path, mmap_mode="r", allow_pickle=False)
             bold, frames = arrays["bold"], arrays["frame_index"]
             if bold.ndim != 2 or bold.shape[1] != ROI_COUNT:

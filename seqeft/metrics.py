@@ -4,7 +4,7 @@ import math
 
 import numpy as np
 
-METRIC_KEYS = ("tcorr", "pixcorr", "conn_mse", "f1_025", "f1_05", "bold_mse")
+METRIC_KEYS = ("tcorr", "bold_mse", "pixcorr", "conn_mse", "f1_025", "f1_05")
 
 
 def _check_constant_columns(value, name):

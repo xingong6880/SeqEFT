@@ -3,9 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-import random
 
-import numpy as np
 import torch
 
 from .models.bold_vae import BOLDVAE, BOLDVAEConfig
@@ -24,18 +22,10 @@ from .models.hybrid_latent_mixer import (
 )
 from .models.labram import LaBraMTemporalEncoder
 from .models.spectral import MultiScaleSpectralEncoder
+from .utils import seed_everything
 
 
 SeqEFT = HybridEEG2BOLDLatentModel
-
-
-def seed_everything(seed: int) -> None:
-    """Seed Python, NumPy, and PyTorch."""
-    random.seed(int(seed))
-    np.random.seed(int(seed) % (2**32))
-    torch.manual_seed(int(seed))
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(int(seed))
 
 
 def build_model(

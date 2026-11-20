@@ -18,16 +18,22 @@ def load_config(path):
     return config
 
 
+def seed_everything(seed: int) -> None:
+    """Seed Python, NumPy, and PyTorch."""
+    seed = int(seed)
+    random.seed(seed)
+    np.random.seed(seed % (2**32))
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
 def configure_runtime(seed):
     """Set the reference precision, thread count, and random seeds."""
     torch.set_num_threads(1)
     torch.set_float32_matmul_precision("high")
     torch.backends.cudnn.allow_tf32 = True
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
+    seed_everything(seed)
 
 
 def write_json(path, value):

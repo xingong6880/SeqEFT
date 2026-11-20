@@ -15,7 +15,7 @@ python -m pytest -q
 
 ## Train and evaluate
 
-Download `EEG_set/` and `fMRI_difumo64/` from the NeuroBOLT dataset and place `labram-base.pth` in `checkpoints/`. Train the VAE once and reuse it for the three alignment runs. Evaluation reports the mean and sample standard deviation across seeds on the fixed development split. [NeuroBOLT dataset](https://huggingface.co/datasets/NeurdyLab/NeuroBOLT/tree/main) · [LaBraM base weights](https://github.com/935963004/LaBraM/blob/main/checkpoints/labram-base.pth) · [Fixed split](configs/splits/resting_state.yaml)
+Download `EEG_set/` and `fMRI_difumo64/` from the NeuroBOLT dataset and place `labram-base.pth` in `checkpoints/`. Train the VAE once and reuse it for the three alignment runs. Evaluation reports the mean and sample standard deviation across seeds on the fixed development split. [NeuroBOLT dataset](https://huggingface.co/datasets/NeurdyLab/NeuroBOLT/tree/dcec0d2c7fb2e8902b54f5b0245e847667937ea4) · [LaBraM base weights](https://github.com/935963004/LaBraM/blob/c431221e6cfd23dbfa9950e0180682fb322b0548/checkpoints/labram-base.pth) · [Fixed split](configs/splits/resting_state.yaml)
 
 ```bash
 python -m seqeft.prepare_data \

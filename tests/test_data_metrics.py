@@ -33,6 +33,19 @@ def test_windows_do_not_cross_frame_gaps():
     assert valid_window_starts(frames) == [0, 512]
 
 
+def test_cache_can_load_from_explicit_array_paths(tmp_path):
+    scan = cache(tmp_path)
+    scan.bold_path = tmp_path / "custom_bold.npy"
+    scan.frame_index_path = tmp_path / "custom_frames.npy"
+    np.save(scan.bold_path, scan.bold)
+    np.save(scan.frame_index_path, scan.frame_index)
+    del scan.bold, scan.frame_index, scan.root
+
+    sample = RandomFixedWindowBOLDDataset([scan])[0]
+    assert sample["bold"][0, 0] == sample["start"]
+    assert sample["frame_index"][0] == sample["start"] + 7
+
+
 def test_random_crops_are_reproducible_and_synchronized(tmp_path):
     first = RandomFixedWindowBOLDDataset([cache(tmp_path)], seed=2026)
     second = RandomFixedWindowBOLDDataset([cache(tmp_path)], seed=2026)
