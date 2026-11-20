@@ -10,7 +10,6 @@ Use Python 3.9 and run the commands from the repository root. The reference GPU 
 
 ```bash
 python -m pip install -e ".[data,test]"
-python -m seqeft.smoke
 python -m pytest -q
 ```
 
